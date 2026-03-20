@@ -486,10 +486,15 @@ struct fft_dkf_4096_template {
             // real = fft_dy.real * fft_u.real + fft_dy.imag * fft_u.imag
             // imag = fft_dy.imag * fft_u.real - fft_dy.real * fft_u.imag
             crt_bf<16, 64> dk_partial;
-            warp::mul(dk_partial.real, fft_dy.real, fft_u.real);  // ac
-            warp::mma(dk_partial.real, fft_dy.imag, fft_u.imag); // ac + bd
-            warp::mul(dk_partial.imag, fft_dy.imag, fft_u.real);  // bc
-            warp::mms(dk_partial.imag, fft_dy.real, fft_u.imag);  // bc - ad
+            rt_bf<16, 64> t1, t2;
+
+            warp::mul(t1, fft_dy.real, fft_u.real);       // ac
+            warp::mul(t2, fft_dy.imag, fft_u.imag);       // bd
+            warp::add(dk_partial.real, t1, t2);            // ac + bd
+
+            warp::mul(t1, fft_dy.imag, fft_u.real);       // bc
+            warp::mul(t2, fft_dy.real, fft_u.imag);       // ad
+            warp::sub(dk_partial.imag, t1, t2);            // bc - ad
 
             // Store dk_f partial (complex) to output
             warpgroup::store(args.output.dk_f_real[warpgroup::groupid()], dk_partial.real);
@@ -763,10 +768,10 @@ std::vector<at::Tensor> fftconv_bwd_dkf(
     bf16 *d_tw_r = reinterpret_cast<bf16*>(tw_real.data_ptr<c10::BFloat16>());
     bf16 *d_tw_i = reinterpret_cast<bf16*>(tw_imag.data_ptr<c10::BFloat16>());
 
-    out_layout dkr_gl{d_dkr, B, H, nullptr, nullptr};
-    out_layout dki_gl{d_dki, B, H, nullptr, nullptr};
-    seq_layout dy_gl{d_dy, B, H, nullptr, nullptr};
-    seq_layout u_gl{d_u, B, H, nullptr, nullptr};
+    out_layout dkr_gl{d_dkr, (unsigned long)B, (unsigned long)H, nullptr, nullptr};
+    out_layout dki_gl{d_dki, (unsigned long)B, (unsigned long)H, nullptr, nullptr};
+    seq_layout dy_gl{d_dy, (unsigned long)B, (unsigned long)H, nullptr, nullptr};
+    seq_layout u_gl{d_u, (unsigned long)B, (unsigned long)H, nullptr, nullptr};
     fft_layout f_gl{
         typename fft_layout::component{d_f_r, nullptr, nullptr, nullptr, nullptr},
         typename fft_layout::component{d_f_i, nullptr, nullptr, nullptr, nullptr}
