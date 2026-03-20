@@ -24,21 +24,35 @@ import math
 import time
 
 # ---- Import kernels ----
+HAS_FUSED = False
+HAS_SEPARATE = False
+HAS_FLASHFFT = False
+
 try:
     from _C import fftconv_bwd_fused
     HAS_FUSED = True
+    print("Loaded: TK fused kernel")
 except ImportError:
-    HAS_FUSED = False
+    pass
 
 try:
     from _C_separate import fftconv_bwd, fftconv_bwd_dkf
     HAS_SEPARATE = True
+    print("Loaded: TK separate kernels (from _C_separate)")
 except ImportError:
     try:
         from _C import fftconv_bwd, fftconv_bwd_dkf
         HAS_SEPARATE = True
+        print("Loaded: TK separate kernels (from _C)")
     except ImportError:
-        HAS_SEPARATE = False
+        pass
+
+try:
+    from flashfftconv import FlashFFTConv
+    HAS_FLASHFFT = True
+    print("Loaded: FlashFFTConv")
+except ImportError:
+    print("FlashFFTConv not available (pip install flashfftconv to enable)")
 
 
 # ============================================================================
@@ -178,6 +192,37 @@ def bench_separate(B, H, N, N1, num_iters=50, warmup=10):
     return np.median(times)
 
 
+def bench_flashfftconv(B, H, N, num_iters=50, warmup=10):
+    """FlashFFTConv forward + backward."""
+    u = torch.randn(B, H, N, device='cuda', dtype=torch.bfloat16)
+    k = torch.randn(H, N, device='cuda', dtype=torch.float32)
+
+    conv = FlashFFTConv(N, dtype=u.dtype).to(u.device)
+    dy = torch.randn(B, H, N, device='cuda', dtype=u.dtype)
+
+    def run():
+        u_in = u.detach().requires_grad_(True)
+        y = conv(u_in, k)
+        loss = (y * dy).sum()
+        loss.backward()
+
+    for _ in range(warmup):
+        run()
+    torch.cuda.synchronize()
+
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+
+    for i in range(num_iters):
+        start_events[i].record()
+        run()
+        end_events[i].record()
+
+    torch.cuda.synchronize()
+    times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    return np.median(times)
+
+
 def bench_fused(B, H, N, N1, num_iters=50, warmup=10):
     """TK fused kernel: du + dk_f in one launch."""
     u = torch.randn(B, H, N, device='cuda', dtype=torch.bfloat16).float() / H
@@ -227,28 +272,39 @@ if __name__ == "__main__":
         (32, 16),
     ]
 
-    print(f"FFTConv Backward Benchmark (N={N})")
-    print(f"{'B':>4} {'H':>4} | {'PyTorch (ms)':>14} ", end="")
+    print(f"\nFFTConv Backward Benchmark (N={N})")
+    print(f"All times are median of 50 iterations, in milliseconds.")
+    print(f"Speedup is relative to PyTorch autograd baseline.\n")
+
+    # Header
+    cols = [f"{'B':>4} {'H':>4}", f"{'PyTorch':>10}"]
+    if HAS_FLASHFFT:
+        cols.append(f"{'FlashFFT':>10} {'spd':>6}")
     if args.mode in ("separate", "all") and HAS_SEPARATE:
-        print(f"| {'Separate (ms)':>14} {'Speedup':>8} ", end="")
+        cols.append(f"{'Separate':>10} {'spd':>6}")
     if args.mode in ("fused", "all") and HAS_FUSED:
-        print(f"| {'Fused (ms)':>14} {'Speedup':>8} ", end="")
-    print()
-    print("-" * 100)
+        cols.append(f"{'Fused':>10} {'spd':>6}")
+    print(" | ".join(cols))
+    print("-" * (len(" | ".join(cols)) + 5))
 
     for B, H in configs:
         pytorch_ms = bench_pytorch_autograd(B, H, N)
+        row = [f"{B:>4} {H:>4}", f"{pytorch_ms:>10.3f}"]
 
-        print(f"{B:>4} {H:>4} | {pytorch_ms:>14.3f} ", end="")
+        if HAS_FLASHFFT:
+            try:
+                flash_ms = bench_flashfftconv(B, H, N)
+                row.append(f"{flash_ms:>10.3f} {pytorch_ms/flash_ms:>5.1f}x")
+            except Exception as e:
+                row.append(f"{'err':>10} {'':>6}")
+                print(f"  FlashFFTConv error: {e}", flush=True)
 
         if args.mode in ("separate", "all") and HAS_SEPARATE:
             sep_ms = bench_separate(B, H, N, N1)
-            speedup = pytorch_ms / sep_ms
-            print(f"| {sep_ms:>14.3f} {speedup:>7.2f}x ", end="")
+            row.append(f"{sep_ms:>10.3f} {pytorch_ms/sep_ms:>5.1f}x")
 
         if args.mode in ("fused", "all") and HAS_FUSED:
             fused_ms = bench_fused(B, H, N, N1)
-            speedup = pytorch_ms / fused_ms
-            print(f"| {fused_ms:>14.3f} {speedup:>7.2f}x ", end="")
+            row.append(f"{fused_ms:>10.3f} {pytorch_ms/fused_ms:>5.1f}x")
 
-        print()
+        print(" | ".join(row))
