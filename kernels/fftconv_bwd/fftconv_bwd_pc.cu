@@ -540,7 +540,11 @@ template<int _wg> struct fftconv_dkf_1024_layout {
 };
 
 struct fft_dkf_1024_template {
-    static constexpr int NUM_CONSUMER_WARPS=8, NUM_CONSUMER_WARPGROUPS=NUM_CONSUMER_WARPS/4, NUM_BLOCKS=1, OUTPUT_PIPE_STAGES=3, INPUT_PIPE_STAGES=3;
+    // INPUT/OUTPUT_PIPE_STAGES=2 (not 3) to stay within 227KB shared memory limit.
+    // dk_f loads two tiles per warpgroup (dy + u) and writes two (real + imag),
+    // so each pipeline stage is larger than the du template. 2 stages matches
+    // the 4096 dk_f template for the same reason.
+    static constexpr int NUM_CONSUMER_WARPS=8, NUM_CONSUMER_WARPGROUPS=NUM_CONSUMER_WARPS/4, NUM_BLOCKS=1, OUTPUT_PIPE_STAGES=2, INPUT_PIPE_STAGES=2;
     using layout = fftconv_dkf_1024_layout<NUM_CONSUMER_WARPGROUPS>;
 
     __device__ static inline void common_setup(common_setup_args<layout> args) {
