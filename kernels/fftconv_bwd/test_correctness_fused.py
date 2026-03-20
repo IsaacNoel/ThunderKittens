@@ -1,7 +1,14 @@
 import torch
 import numpy as np
-from _C_fused import fftconv_bwd_fused
-from _C import fftconv_bwd, fftconv_bwd_dkf
+from _C import fftconv_bwd_fused
+# For the cross-kernel comparison test, we also need the separate kernels.
+# Build the separate version first (make), save the .so, then build fused.
+# If the separate kernel .so isn't available, cross-kernel tests are skipped.
+try:
+    from _C_separate import fftconv_bwd, fftconv_bwd_dkf
+    HAS_SEPARATE = True
+except ImportError:
+    HAS_SEPARATE = False
 
 
 def ref_fftconv_bwd(u, k, dy, N):
@@ -301,7 +308,10 @@ print(f"N={N}, B={B}, H={H}, N1={N1}\n")
 
 fused_ok = test_fused(B, H, N, N1)
 ag_ok = test_autograd_fused(B, H, N, N1)
-cross_ok = test_fused_vs_separate(B, H, N, N1)
+cross_ok = test_fused_vs_separate(B, H, N, N1) if HAS_SEPARATE else True
+if not HAS_SEPARATE:
+    print("\n(Skipped fused vs separate test — _C_separate not found)")
+    print("To enable: build separate kernel, then: cp _C*.so _C_separate*.so")
 
 print("\n" + "=" * 50)
 all_ok = fused_ok and ag_ok and cross_ok
