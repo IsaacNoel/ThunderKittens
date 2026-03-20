@@ -376,34 +376,44 @@ def test_autograd(B, H, N, N1):
 # Run tests
 # ============================================================================
 
-N = 4096
-B = 2
-H = 4
-N1 = int(np.sqrt(N))
+all_passed = True
 
-print(f"FFTConv backward correctness tests")
-print(f"N={N}, B={B}, H={H}, N1={N1}\n")
+for N in [4096, 1024]:
+    B = 2
+    H = 4
+    N1 = int(np.sqrt(N))
 
-du_ok  = test_du(B, H, N, N1)
-dkf_ok = test_dkf(B, H, N, N1)
-ag_ok  = test_autograd(B, H, N, N1)
+    print(f"FFTConv backward correctness tests")
+    print(f"N={N}, B={B}, H={H}, N1={N1}\n")
 
-print("=" * 50)
-all_ok = du_ok and dkf_ok and ag_ok
-if all_ok:
-    print("ALL TESTS PASSED")
+    du_ok  = test_du(B, H, N, N1)
+    dkf_ok = test_dkf(B, H, N, N1)
+    ag_ok  = test_autograd(B, H, N, N1)
+
+    print("=" * 50)
+    ok = du_ok and dkf_ok and ag_ok
+    if ok:
+        print(f"ALL TESTS PASSED (N={N})")
+    else:
+        if not du_ok:  print(f"FAILED: du kernel (N={N})")
+        if not dkf_ok: print(f"FAILED: dk_f kernel (N={N})")
+        if not ag_ok:  print(f"FAILED: autograd cross-validation (N={N})")
+    all_passed = all_passed and ok
+
+    # Stress tests
+    print(f"\n=== Stress tests (N={N}) ===\n")
+    for b, h in [(1,1), (4,8), (16,16), (32,4)]:
+        d_ok = test_du(b, h, N, N1)
+        k_ok = test_dkf(b, h, N, N1)
+        if not (d_ok and k_ok):
+            print(f"FAILED at B={b}, H={h}, N={N}")
+            all_passed = False
+            break
+    else:
+        print(f"All stress tests passed (N={N})")
+
+print("\n" + "=" * 50)
+if all_passed:
+    print("ALL TESTS PASSED (all N values)")
 else:
-    if not du_ok:  print("FAILED: du kernel")
-    if not dkf_ok: print("FAILED: dk_f kernel")
-    if not ag_ok:  print("FAILED: autograd cross-validation")
-
-# Stress tests
-print("\n=== Stress tests ===\n")
-for b, h in [(1,1), (4,8), (16,16), (32,4)]:
-    d_ok = test_du(b, h, N, N1)
-    k_ok = test_dkf(b, h, N, N1)
-    if not (d_ok and k_ok):
-        print(f"FAILED at B={b}, H={h}")
-        break
-else:
-    print("All stress tests passed")
+    print("SOME TESTS FAILED")

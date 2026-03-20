@@ -1,5 +1,32 @@
 # fftconv_bwd — Change Log
 
+## Phase 6: N=1024 support for dk_f kernel
+
+### New: fft_dkf_1024_template (filter gradient for N=1024)
+
+**File:** `fftconv_bwd_pc.cu`
+
+**Problem:** The dk_f (filter gradient) kernel only supported N=4096. N=1024 was missing,
+meaning the full backward pass could not run at sequence length 1024.
+
+**What was added:**
+- `fftconv_dkf_1024_layout`: Layout struct for N=1024 dk_f. Uses `gl<bf16, -1, -1, 32, 32>`
+  seq/out layouts (32x32 subtiles) and `cgl<gl<bf16, 1, 1, 64, 64>>` for FFT matrices.
+- `fft_dkf_1024_template`: Template struct combining the subtile<32,32> packing pattern
+  from the 1024 du template (4 batch elements per 64x64 shared tile) with the dk_f compute
+  logic from the 4096 dk_f template (monarch_fft + conjugate multiply).
+- `fft_dkf_template_internal` / `fft_dkf_template<N>`: Template dispatch that selects
+  1024 or 4096 dk_f template based on N.
+- `setup_dkf_globals<SEQ>` / `launch_dkf<SEQ>`: Templated setup and launch functions
+  (matching the pattern of `setup_du_globals` / `launch_du`).
+- Updated `fftconv_bwd_dkf` PyTorch binding to accept N=1024 or N=4096 and dispatch
+  accordingly.
+
+**Test changes:** `test_correctness.py` now runs all tests (du, dk_f, autograd) for both
+N=4096 and N=1024, including stress tests across batch/head configurations.
+
+**Impact:** N=4096 path is completely unchanged. Only additive changes.
+
 ## Phase 2: Correctness Audit
 
 ### Bug Fix 1: Missing `.conj()` in `pytorch_ref.py`
@@ -57,3 +84,30 @@ moderate batch sizes, but may lose precision for very large B.
 **Shared memory aliasing:** Verified that `input_tile`, `fft_dy_save`, `dk_f_acc`, and
 `tmp` in the fused kernel are never written/read concurrently across phases. All phase
 transitions are guarded by `__syncthreads()`.
+
+## Phase 3: Code Quality
+
+### Input validation (matching fftconv forward style)
+
+**Files:** `fftconv_bwd_pc.cu`, `fftconv_bwd_fused.cu`
+
+Added `TORCH_CHECK` assertions to all PyTorch binding functions:
+- `fftconv_bwd`: validates N (1024 or 4096), N1*N1==N, dy shape, matrix dimensions (64x64)
+- `fftconv_bwd_dkf`: validates N==4096, N1==64, dy/u shapes, matrix dimensions
+- `fftconv_bwd_fused`: validates N==4096, N1==64, dy/u shapes, matrix dimensions
+
+Matches the validation style of `kernels/fftconv/fftconv_pc.cu` (forward kernel).
+
+## Phase 4: Benchmarks
+
+Benchmark infrastructure already existed in `benchmarks/run_benchmarks.py`. No changes needed.
+
+The script benchmarks TK fused backward kernel vs PyTorch autograd backward for N=4096
+across 6 configurations (B=2..32, H=4..16). Results are saved as JSON and PNG.
+
+Note: The requested sequence lengths (768, 1536, 3072, 6144, 12288) are not supported by
+the Monarch decomposition (requires N = N1^2, a perfect square). Supported sizes: 1024, 4096.
+
+## Phase 5: PR Proposal
+
+Updated `PR_PROPOSAL.md` with input validation section and benchmark references.

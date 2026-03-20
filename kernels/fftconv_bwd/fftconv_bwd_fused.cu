@@ -291,6 +291,14 @@ std::vector<at::Tensor> fftconv_bwd_fused(
     CHECK_INPUT(tw_real); CHECK_INPUT(tw_imag);
     CHECK_INPUT(twinv_bwd_real); CHECK_INPUT(twinv_bwd_imag);
 
+    TORCH_CHECK(N == 4096, "fused backward kernel only supports N=4096, got ", N);
+    TORCH_CHECK(N1 == 64, "fused backward kernel requires N1=64, got ", N1);
+    TORCH_CHECK(dy.size(0) == B && dy.size(1) == H, "dy shape mismatch");
+    TORCH_CHECK(u.size(0) == B && u.size(1) == H, "u shape mismatch");
+    TORCH_CHECK(f_real.size(0) == 64 && f_real.size(1) == 64, "f_real must be 64x64");
+    TORCH_CHECK(finv_real.size(0) == 64 && finv_real.size(1) == 64, "finv_real must be 64x64");
+    TORCH_CHECK(tw_real.size(0) == 64 && tw_real.size(1) == 64, "tw_real must be 64x64");
+
     at::Tensor du_out     = at::empty({B, H, N1, N1}, dy.options());
     at::Tensor dk_f_r_out = at::zeros({1, H, N1, N1}, dy.options()); // zeros — kernel accumulates
     at::Tensor dk_f_i_out = at::zeros({1, H, N1, N1}, dy.options());

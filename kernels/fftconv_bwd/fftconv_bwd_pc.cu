@@ -515,12 +515,177 @@ struct fft_dkf_4096_template {
 
 
 // ============================================================================
+// Layout and template for dk_f (1024 variant)
+// Same compute as 4096 dk_f, but uses subtile<32,32> packing (4 batch
+// elements per 64x64 shared tile), matching the 1024 du template pattern.
+// ============================================================================
+
+template<int _wg> struct fftconv_dkf_1024_layout {
+    static constexpr int wg = _wg;
+    using seq_tile      = st_bf<64, 64>;
+    using seq_layout    =     gl<bf16, -1, -1, 32, 32>;
+    using fft_layout    = cgl<gl<bf16,  1,  1, 64, 64>>;
+    using out_layout    =     gl<bf16, -1, -1, 32, 32>;
+    struct globals {
+        out_layout dk_f_real, dk_f_imag;   // output: per-batch dk_f partial (complex)
+        seq_layout dy, u;                   // inputs: grad output + original input
+        fft_layout f, tw;                   // FFT matrix + twiddle (not conjugated — actual forward FFT)
+    };
+    struct input_block  { seq_tile dy[wg]; seq_tile u[wg]; };
+    struct output_block { seq_tile dk_f_real[wg]; seq_tile dk_f_imag[wg]; };
+    struct scratch_block {
+        cst_bf<64, 64> f, tw, tmp_dy[2], tmp_u[2];
+    };
+    struct consumer_state { };
+};
+
+struct fft_dkf_1024_template {
+    static constexpr int NUM_CONSUMER_WARPS=8, NUM_CONSUMER_WARPGROUPS=NUM_CONSUMER_WARPS/4, NUM_BLOCKS=1, OUTPUT_PIPE_STAGES=3, INPUT_PIPE_STAGES=3;
+    using layout = fftconv_dkf_1024_layout<NUM_CONSUMER_WARPGROUPS>;
+
+    __device__ static inline void common_setup(common_setup_args<layout> args) {
+        int heads_handled = (args.globals.dy.depth()+131-blockIdx.x) / 132;
+        int iters_per_head = (args.globals.dy.batch() + (NUM_CONSUMER_WARPGROUPS*4)-1) / (NUM_CONSUMER_WARPGROUPS*4);
+        args.num_iters = args.task_iter == 0 ? heads_handled * iters_per_head : -1;
+    }
+
+    struct producer {
+        __device__ static inline void setup(producer_setup_args<layout> args) {
+            warpgroup::decrease_registers<40>();
+        }
+        __device__ static inline void load(producer_load_args<layout> args) {
+            int iters_per_head = (args.globals.dy.batch() + (NUM_CONSUMER_WARPGROUPS*4)-1) / (NUM_CONSUMER_WARPGROUPS*4);
+            int head  = (args.iter / iters_per_head)*132 + blockIdx.x;
+            int batch = (args.iter % iters_per_head) * (NUM_CONSUMER_WARPGROUPS*4);
+            if(warpgroup::warpid() == args.iter%4) {
+                for(int b = batch; b < batch+(NUM_CONSUMER_WARPGROUPS*4) && b < args.globals.dy.batch(); b++) {
+                    int diff = b-batch;
+                    auto st_dy = args.input.dy[diff/4].template subtile<32,32>({(diff%4)/2, diff%2});
+                    auto st_u  = args.input.u[diff/4].template subtile<32,32>({(diff%4)/2, diff%2});
+                    warp::load_async(st_dy, args.globals.dy, { b, head, 0, 0 });
+                    warp::load_async(st_u,  args.globals.u,  { b, head, 0, 0 });
+                }
+                load_async_wait();
+                if(laneid() == 0) arrive(args.inputs_arrived, 4);
+                __syncwarp();
+            }
+        }
+        __device__ static inline void store(producer_store_args<layout> args) {
+            int iters_per_head = (args.globals.dy.batch() + (NUM_CONSUMER_WARPGROUPS*4)-1) / (NUM_CONSUMER_WARPGROUPS*4);
+            int head  = (args.iter / iters_per_head)*132 + blockIdx.x;
+            int batch = (args.iter % iters_per_head) * (NUM_CONSUMER_WARPGROUPS*4);
+            if(warpgroup::warpid() == args.iter%4) {
+                for(int b = batch; b < batch+(NUM_CONSUMER_WARPGROUPS*4) && b < args.globals.dy.batch(); b++) {
+                    int diff = b-batch;
+                    auto st_r = args.output.dk_f_real[diff/4].subtile<32,32>({(diff%4)/2, diff%2});
+                    auto st_i = args.output.dk_f_imag[diff/4].subtile<32,32>({(diff%4)/2, diff%2});
+                    warp::store(args.globals.dk_f_real, st_r, { b, head, 0, 0 });
+                    warp::store(args.globals.dk_f_imag, st_i, { b, head, 0, 0 });
+                }
+                __syncwarp();
+                if(laneid() == 0) arrive(args.outputs_finished, 4);
+                __syncwarp();
+            }
+        }
+    };
+
+    struct consumer {
+        __device__ static inline void setup(consumer_setup_args<layout> args) {
+            warpgroup::increase_registers<232>();
+            using consumers = group<NUM_CONSUMER_WARPS>;
+            consumers::load(args.scratch.f,  args.globals.f,  {0, 0, 0, 0});
+            consumers::load(args.scratch.tw, args.globals.tw, {0, 0, 0, 0});
+        }
+
+        // Helper: apply Monarch FFT to a tile. Returns result in accum.
+        // Computes: F @ X → *= tw → @ F
+        __device__ static inline void monarch_fft(
+            crt_bf<16,64> &accum, crt_fl<16,64> &mma_reg, crt_bf<16,64> &tw_tmp,
+            const cst_bf<64,64> &f_smem, const cst_bf<64,64> &tw_smem,
+            const st_bf<64,64> &input_tile
+        ) {
+            // Stage 1: F @ X (left multiply, input is real)
+            warpgroup::mm_AB(mma_reg.real, f_smem.real, input_tile);
+            warpgroup::mm_AB(mma_reg.imag, f_smem.imag, input_tile);
+            warpgroup::mma_async_wait();
+            warp::copy(accum, mma_reg);
+
+            // Twiddle: *= tw
+            warpgroup::load(tw_tmp, tw_smem);
+            warp::mul(accum, accum, tw_tmp);
+
+            // Stage 2: @ F (right multiply, complex)
+            group<NUM_CONSUMER_WARPS>::sync(2);
+            warpgroup::mm_AB(mma_reg, accum, f_smem);
+            warpgroup::mma_async_wait();
+            warp::copy(accum, mma_reg);
+        }
+
+        __device__ static inline void compute(consumer_compute_args<layout> args) {
+            int wgid = warpgroup::groupid();
+            int default_barrer_id = wgid + 4;
+
+            crt_fl<16, 64> mma_reg;
+            crt_bf<16, 64> fft_dy, fft_u, tw_tmp;
+
+            // FFT(dy)
+            monarch_fft(fft_dy, mma_reg, tw_tmp,
+                        args.scratch.f, args.scratch.tw,
+                        args.input.dy[warpgroup::groupid()]);
+
+            // Save FFT(dy) to scratch (need registers for FFT(u))
+            warpgroup::store(args.scratch.tmp_dy[warpgroup::groupid()], fft_dy);
+            warpgroup::sync(default_barrer_id);
+
+            // FFT(u)
+            monarch_fft(fft_u, mma_reg, tw_tmp,
+                        args.scratch.f, args.scratch.tw,
+                        args.input.u[warpgroup::groupid()]);
+
+            // Reload FFT(dy)
+            warpgroup::load(fft_dy, args.scratch.tmp_dy[warpgroup::groupid()]);
+
+            // dk_f_partial = FFT(dy) * conj(FFT(u))
+            // conj(fft_u): negate imaginary part
+            // (a+bi)(c-di) = (ac+bd) + (bc-ad)i
+            crt_bf<16, 64> dk_partial;
+            rt_bf<16, 64> t1, t2;
+
+            warp::mul(t1, fft_dy.real, fft_u.real);       // ac
+            warp::mul(t2, fft_dy.imag, fft_u.imag);       // bd
+            warp::add(dk_partial.real, t1, t2);            // ac + bd
+
+            warp::mul(t1, fft_dy.imag, fft_u.real);       // bc
+            warp::mul(t2, fft_dy.real, fft_u.imag);       // ad
+            warp::sub(dk_partial.imag, t1, t2);            // bc - ad
+
+            // Store dk_f partial (complex) to output
+            warpgroup::store(args.output.dk_f_real[warpgroup::groupid()], dk_partial.real);
+            warpgroup::store(args.output.dk_f_imag[warpgroup::groupid()], dk_partial.imag);
+            warpgroup::sync(default_barrer_id);
+
+            if(laneid() == 0) {
+                arrive(args.inputs_finished);
+                arrive(args.outputs_arrived);
+            }
+            __syncwarp();
+        }
+        __device__ static inline void finish(consumer_finish_args<layout> args) { if(laneid() == 0) arrive(args.finish_finished); }
+    };
+};
+
+
+// ============================================================================
 // Template dispatch
 // ============================================================================
 
 template<int N> struct fft_bwd_template_internal  { using type = fft_bwd_1024_template; };
 template<> struct fft_bwd_template_internal<4096> { using type = fft_bwd_4096_template; };
 template<int N> using fft_bwd_template = fft_bwd_template_internal<N>::type;
+
+template<int N> struct fft_dkf_template_internal  { using type = fft_dkf_1024_template; };
+template<> struct fft_dkf_template_internal<4096> { using type = fft_dkf_4096_template; };
+template<int N> using fft_dkf_template = typename fft_dkf_template_internal<N>::type;
 
 
 template<int SEQ> typename fft_bwd_template<SEQ>::layout::globals setup_du_globals(
@@ -582,6 +747,56 @@ template<int SEQ> typename fft_bwd_template<SEQ>::layout::globals setup_du_globa
 template<int SEQ>
 void launch_du(typename fft_bwd_template<SEQ>::layout::globals G) {
     using fftst = fft_bwd_template<SEQ>;
+    unsigned long mem_size = (MAX_SHARED_MEMORY-1024);
+    cudaFuncSetAttribute(
+        prototype::lcsf::kernel<fftst>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        mem_size
+    );
+    dim3 grid(132);
+    dim3 block(prototype::detail::NUM_THREADS_v<fftst>);
+#ifdef TK_COMPILE_FFTCONV_BWD
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    prototype::lcsf::kernel<fftst><<<grid, block, mem_size, stream>>>(G);
+#else
+    prototype::lcsf::kernel<fftst><<<grid, block, mem_size>>>(G);
+#endif
+}
+
+
+template<int SEQ> typename fft_dkf_template<SEQ>::layout::globals setup_dkf_globals(
+    bf16 *d_dk_f_real, bf16 *d_dk_f_imag,
+    bf16 *d_dy, bf16 *d_u,
+    bf16 *d_f_real, bf16 *d_f_imag,
+    bf16 *d_tw_real, bf16 *d_tw_imag,
+    int B, int H
+) {
+    using fftst = fft_dkf_template<SEQ>;
+    using globals    = typename fftst::layout::globals;
+    using fft_layout = typename fftst::layout::fft_layout;
+    using seq_layout = typename fftst::layout::seq_layout;
+    using out_layout = typename fftst::layout::out_layout;
+
+    out_layout dkr_gl{d_dk_f_real, B, H, nullptr, nullptr};
+    out_layout dki_gl{d_dk_f_imag, B, H, nullptr, nullptr};
+    seq_layout dy_gl{d_dy, B, H, nullptr, nullptr};
+    seq_layout u_gl{d_u, B, H, nullptr, nullptr};
+    fft_layout f_gl{
+        typename fft_layout::component{d_f_real, nullptr, nullptr, nullptr, nullptr},
+        typename fft_layout::component{d_f_imag, nullptr, nullptr, nullptr, nullptr}
+    };
+    fft_layout tw_gl{
+        typename fft_layout::component{d_tw_real, nullptr, nullptr, nullptr, nullptr},
+        typename fft_layout::component{d_tw_imag, nullptr, nullptr, nullptr, nullptr}
+    };
+
+    globals G{ dkr_gl, dki_gl, dy_gl, u_gl, f_gl, tw_gl };
+    return G;
+}
+
+template<int SEQ>
+void launch_dkf(typename fft_dkf_template<SEQ>::layout::globals G) {
+    using fftst = fft_dkf_template<SEQ>;
     unsigned long mem_size = (MAX_SHARED_MEMORY-1024);
     cudaFuncSetAttribute(
         prototype::lcsf::kernel<fftst>,
@@ -680,9 +895,18 @@ at::Tensor fftconv_bwd(
     CHECK_INPUT(twinv_t_bwd_real);
     CHECK_INPUT(twinv_t_bwd_imag);
 
-    TORCH_CHECK(dy_real.size(0) == B, "dy_real has incompatible batch shape");
-    TORCH_CHECK(dy_real.size(1) == H, "dy_real has incompatible head shape");
-    TORCH_CHECK(dy_real.size(2) == N1, "dy_real has incompatible sequence shape");
+    TORCH_CHECK(N == 4096 || N == 1024, "N must be 1024 or 4096, got ", N);
+    TORCH_CHECK(N1 * N1 == N, "N1*N1 must equal N");
+    TORCH_CHECK(dy_real.size(0) == B, "dy_real batch dim mismatch: expected ", B, " got ", dy_real.size(0));
+    TORCH_CHECK(dy_real.size(1) == H, "dy_real head dim mismatch: expected ", H, " got ", dy_real.size(1));
+    TORCH_CHECK(dy_real.size(2) == N1, "dy_real row dim mismatch: expected ", N1, " got ", dy_real.size(2));
+
+    TORCH_CHECK(f_real.size(0) == 64 && f_real.size(1) == 64, "f_real must be 64x64");
+    TORCH_CHECK(f_imag.size(0) == 64 && f_imag.size(1) == 64, "f_imag must be 64x64");
+    TORCH_CHECK(finv_real.size(0) == 64 && finv_real.size(1) == 64, "finv_real must be 64x64");
+    TORCH_CHECK(finv_imag.size(0) == 64 && finv_imag.size(1) == 64, "finv_imag must be 64x64");
+    TORCH_CHECK(tw_bwd_real.size(0) == 64 && tw_bwd_real.size(1) == 64, "tw_bwd_real must be 64x64");
+    TORCH_CHECK(tw_bwd_imag.size(0) == 64 && tw_bwd_imag.size(1) == 64, "tw_bwd_imag must be 64x64");
 
     at::Tensor du = at::empty({B, H, N1, N1}, dy_real.options());
 
@@ -711,23 +935,7 @@ at::Tensor fftconv_bwd(
     return du;
 }
 
-// ---- dk_f kernel launch ----
-
-void launch_dkf(
-    typename fft_dkf_4096_template::layout::globals G
-) {
-    using fftst = fft_dkf_4096_template;
-    unsigned long mem_size = (MAX_SHARED_MEMORY-1024);
-    cudaFuncSetAttribute(
-        prototype::lcsf::kernel<fftst>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        mem_size
-    );
-    dim3 grid(132);
-    dim3 block(prototype::detail::NUM_THREADS_v<fftst>);
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    prototype::lcsf::kernel<fftst><<<grid, block, mem_size, stream>>>(G);
-}
+// ---- dk_f kernel dispatch ----
 
 /**
  * fftconv_bwd_dkf — Filter gradient for FFT convolution.
@@ -752,14 +960,15 @@ std::vector<at::Tensor> fftconv_bwd_dkf(
     CHECK_INPUT(tw_real);
     CHECK_INPUT(tw_imag);
 
+    TORCH_CHECK(N == 4096 || N == 1024, "dk_f kernel supports N=1024 or N=4096, got ", N);
+    TORCH_CHECK(N1 * N1 == N, "N1*N1 must equal N");
+    TORCH_CHECK(dy_real.size(0) == B && dy_real.size(1) == H, "dy_real shape mismatch");
+    TORCH_CHECK(u_real.size(0) == B && u_real.size(1) == H, "u_real shape mismatch");
+    TORCH_CHECK(f_real.size(0) == 64 && f_real.size(1) == 64, "f_real must be 64x64");
+    TORCH_CHECK(tw_real.size(0) == 64 && tw_real.size(1) == 64, "tw_real must be 64x64");
+
     at::Tensor dk_f_real = at::empty({B, H, N1, N1}, dy_real.options());
     at::Tensor dk_f_imag = at::empty({B, H, N1, N1}, dy_real.options());
-
-    using fftst = fft_dkf_4096_template;
-    using globals       = fftst::layout::globals;
-    using fft_layout    = fftst::layout::fft_layout;
-    using seq_layout    = fftst::layout::seq_layout;
-    using out_layout    = fftst::layout::out_layout;
 
     bf16 *d_dy  = reinterpret_cast<bf16*>(dy_real.data_ptr<c10::BFloat16>());
     bf16 *d_u   = reinterpret_cast<bf16*>(u_real.data_ptr<c10::BFloat16>());
@@ -770,21 +979,13 @@ std::vector<at::Tensor> fftconv_bwd_dkf(
     bf16 *d_tw_r = reinterpret_cast<bf16*>(tw_real.data_ptr<c10::BFloat16>());
     bf16 *d_tw_i = reinterpret_cast<bf16*>(tw_imag.data_ptr<c10::BFloat16>());
 
-    out_layout dkr_gl{d_dkr, (unsigned long)B, (unsigned long)H, nullptr, nullptr};
-    out_layout dki_gl{d_dki, (unsigned long)B, (unsigned long)H, nullptr, nullptr};
-    seq_layout dy_gl{d_dy, (unsigned long)B, (unsigned long)H, nullptr, nullptr};
-    seq_layout u_gl{d_u, (unsigned long)B, (unsigned long)H, nullptr, nullptr};
-    fft_layout f_gl{
-        typename fft_layout::component{d_f_r, nullptr, nullptr, nullptr, nullptr},
-        typename fft_layout::component{d_f_i, nullptr, nullptr, nullptr, nullptr}
-    };
-    fft_layout tw_gl{
-        typename fft_layout::component{d_tw_r, nullptr, nullptr, nullptr, nullptr},
-        typename fft_layout::component{d_tw_i, nullptr, nullptr, nullptr, nullptr}
-    };
-
-    globals G{ dkr_gl, dki_gl, dy_gl, u_gl, f_gl, tw_gl };
-    launch_dkf(G);
+    if (N == 4096) {
+        auto G = setup_dkf_globals<4096>(d_dkr, d_dki, d_dy, d_u, d_f_r, d_f_i, d_tw_r, d_tw_i, B, H);
+        launch_dkf<4096>(G);
+    } else {
+        auto G = setup_dkf_globals<1024>(d_dkr, d_dki, d_dy, d_u, d_f_r, d_f_i, d_tw_r, d_tw_i, B, H);
+        launch_dkf<1024>(G);
+    }
 
     CHECK_CUDA_ERROR(cudaGetLastError());
     return {dk_f_real, dk_f_imag};
