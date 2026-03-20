@@ -55,11 +55,11 @@ def ref_fftconv_bwd(u, k, dy, N):
     k_f = torch.fft.fft(k, n=N)
     u_f = torch.fft.fft(u, n=N)
 
-    # du: convolve upstream gradient with the filter
-    du = torch.fft.ifft(dy_f * k_f, n=N).real[..., :L]
+    # du: convolve upstream gradient with the conjugate filter
+    du = torch.fft.ifft(dy_f * k_f.conj(), n=N).real[..., :L]
 
-    # dk: convolve upstream gradient with the input, sum over batch
-    dk = torch.fft.ifft(dy_f * u_f, n=N).real.sum(dim=0)[..., :L]
+    # dk: convolve upstream gradient with the conjugate input, sum over batch
+    dk = torch.fft.ifft(dy_f * u_f.conj(), n=N).real.sum(dim=0)[..., :L]
 
     return du, dk
 

@@ -181,7 +181,9 @@ struct fft_bwd_1024_template {
             __syncwarp();
 
             // persistent grid: reload filter for next head
-            int iters_per_head = (args.globals.dy.batch() + NUM_CONSUMER_WARPGROUPS-1) / NUM_CONSUMER_WARPGROUPS;
+            // NOTE: must use *4 divisor to match common_setup and producer,
+            // since 1024 variant packs 4 subtiles (32x32) per 64x64 tile.
+            int iters_per_head = (args.globals.dy.batch() + (NUM_CONSUMER_WARPGROUPS*4)-1) / (NUM_CONSUMER_WARPGROUPS*4);
             int next_head = ((args.iter+1) / iters_per_head)*132 + blockIdx.x;
             if(next_head != args.state.current_head) {
                 load_head_data(args.scratch, args.globals, next_head);
