@@ -268,6 +268,111 @@ def test_dkf(B, H, N, N1):
 
 
 # ============================================================================
+# Autograd cross-validation
+# Tests the full chain: forward kernel → loss → our backward kernels
+# vs. PyTorch autograd through ref_fftconv.
+# This is the gold standard — no hand-derived reference involved.
+# ============================================================================
+
+def test_autograd(B, H, N, N1):
+    print(f"=== Autograd cross-validation (B={B}, H={H}, N={N}) ===\n")
+
+    torch.manual_seed(42)
+    u  = (torch.randn((B, H, N), dtype=torch.bfloat16, device='cuda')).float() / H
+    k  = (torch.randn((H, N),    dtype=torch.bfloat16, device='cuda')).float() / H
+
+    # --- Autograd reference: differentiate through ref_fftconv ---
+    u_ag = u.clone().detach().requires_grad_(True)
+    k_ag = k.clone().detach().requires_grad_(True)
+
+    y = ref_fftconv(u_ag, k_ag, N)
+    # Use a random loss to exercise all elements
+    torch.manual_seed(99)
+    loss_weights = torch.randn_like(y)
+    loss = (y * loss_weights).sum()
+    loss.backward()
+
+    du_autograd = u_ag.grad.detach()            # (B, H, N)
+    dk_autograd = k_ag.grad.detach()            # (H, N)
+
+    # --- Our du kernel ---
+    # dy for our kernel = d(loss)/d(y) = loss_weights (real)
+    dy = loss_weights.detach()
+
+    (dy_real, kf_conj_real, kf_conj_imag,
+     f_real, f_imag, finv_real, finv_imag,
+     tw_bwd_real, tw_bwd_imag,
+     twinv_t_bwd_real, twinv_t_bwd_imag) = prepare_du_inputs(u, k, dy, B, H, N, N1)
+
+    dy_real = dy_real.cuda().contiguous()
+    kf_conj_real = kf_conj_real.cuda().contiguous()
+    kf_conj_imag = kf_conj_imag.cuda().contiguous()
+    f_real = f_real.cuda().contiguous()
+    f_imag = f_imag.cuda().contiguous()
+    finv_real = finv_real.cuda().contiguous()
+    finv_imag = finv_imag.cuda().contiguous()
+    tw_bwd_real = tw_bwd_real.cuda().contiguous()
+    tw_bwd_imag = tw_bwd_imag.cuda().contiguous()
+    twinv_t_bwd_real = twinv_t_bwd_real.cuda().contiguous()
+    twinv_t_bwd_imag = twinv_t_bwd_imag.cuda().contiguous()
+
+    du_out = fftconv_bwd(
+        dy_real,
+        kf_conj_real, kf_conj_imag,
+        f_real, f_imag,
+        finv_real, finv_imag,
+        tw_bwd_real, tw_bwd_imag,
+        twinv_t_bwd_real, twinv_t_bwd_imag,
+        B, H, N, N1
+    ).reshape(B, H, N)
+
+    du_err = (du_out.float() - du_autograd.float().cuda()).abs()
+    du_max_rel = du_err.max().item() / du_autograd.float().abs().max().item()
+
+    print(f"du vs autograd  max rel error: {du_max_rel:.6e}")
+    du_ok = du_max_rel < 0.05
+    print(f"du PASSED: {du_ok}")
+
+    # --- Our dk_f kernel ---
+    dy_real_dkf, u_real_dkf, f_real_dkf, f_imag_dkf, tw_real_dkf, tw_imag_dkf = prepare_dkf_inputs(
+        u, dy, B, H, N, N1
+    )
+    dy_real_dkf = dy_real_dkf.cuda().contiguous()
+    u_real_dkf  = u_real_dkf.cuda().contiguous()
+    f_real_dkf  = f_real_dkf.cuda().contiguous()
+    f_imag_dkf  = f_imag_dkf.cuda().contiguous()
+    tw_real_dkf = tw_real_dkf.cuda().contiguous()
+    tw_imag_dkf = tw_imag_dkf.cuda().contiguous()
+
+    dk_f_real_out, dk_f_imag_out = fftconv_bwd_dkf(
+        dy_real_dkf, u_real_dkf,
+        f_real_dkf, f_imag_dkf,
+        tw_real_dkf, tw_imag_dkf,
+        B, H, N, N1
+    )
+
+    # Sum over batch, convert to time domain to compare with autograd's dk
+    dk_f_out = torch.complex(
+        dk_f_real_out.float().sum(dim=0),
+        dk_f_imag_out.float().sum(dim=0)
+    ).reshape(H, N1, N1)
+
+    # dk_f_out is in permuted frequency domain. Convert back to time domain:
+    #   unpermute → IFFT → dk_time
+    dk_f_unperm = dk_f_out.transpose(-1, -2).reshape(H, N)
+    dk_time = torch.fft.ifft(dk_f_unperm, n=N).real
+
+    dk_err = (dk_time.cuda() - dk_autograd.float().cuda()).abs()
+    dk_max_rel = dk_err.max().item() / dk_autograd.float().abs().max().item()
+
+    print(f"\ndk vs autograd  max rel error: {dk_max_rel:.6e}")
+    dk_ok = dk_max_rel < 0.05
+    print(f"dk PASSED: {dk_ok}\n")
+
+    return du_ok and dk_ok
+
+
+# ============================================================================
 # Run tests
 # ============================================================================
 
@@ -281,10 +386,24 @@ print(f"N={N}, B={B}, H={H}, N1={N1}\n")
 
 du_ok  = test_du(B, H, N, N1)
 dkf_ok = test_dkf(B, H, N, N1)
+ag_ok  = test_autograd(B, H, N, N1)
 
 print("=" * 50)
-if du_ok and dkf_ok:
+all_ok = du_ok and dkf_ok and ag_ok
+if all_ok:
     print("ALL TESTS PASSED")
 else:
     if not du_ok:  print("FAILED: du kernel")
     if not dkf_ok: print("FAILED: dk_f kernel")
+    if not ag_ok:  print("FAILED: autograd cross-validation")
+
+# Stress tests
+print("\n=== Stress tests ===\n")
+for b, h in [(1,1), (4,8), (16,16), (32,4)]:
+    d_ok = test_du(b, h, N, N1)
+    k_ok = test_dkf(b, h, N, N1)
+    if not (d_ok and k_ok):
+        print(f"FAILED at B={b}, H={h}")
+        break
+else:
+    print("All stress tests passed")
