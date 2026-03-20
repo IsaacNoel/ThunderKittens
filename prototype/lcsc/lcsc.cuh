@@ -1,7 +1,6 @@
 #pragma once
 
 #include "../include/kittens.cuh"
-#include "../common/common.cuh"
 
 namespace kittens {
 namespace prototype {
@@ -11,7 +10,7 @@ template <typename config>
 concept has_min_blocks_per_sm = requires { std::integral_constant<int, int(config::MIN_BLOCKS_PER_SM)>{}; };
 
 template <typename config>
-consteval int min_blocks_per_sm() {
+__host__ consteval int min_blocks_per_sm() {
     if constexpr(has_min_blocks_per_sm<config>)
         return config::MIN_BLOCKS_PER_SM;
     else

@@ -17,7 +17,6 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
-#include <semaphore.h>
 #include <stdexcept>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -26,7 +25,6 @@
 #include <sys/un.h>
 #include <sys/uio.h>
 #include <unistd.h>
-#include <vector>
 
 #if defined(WIN32) || defined(_WIN32) || defined(WIN64) || defined(_WIN64)
     #error "KittensBroker is not supported on Windows"
@@ -383,8 +381,8 @@ struct KittensBroker {
         detail::broker::sync(local_world_size_, shm_);
     }
 
-    KittensBroker(const KittensBroker&) = delete;
-    KittensBroker& operator=(const KittensBroker&) = delete;
+    __host__ KittensBroker(const KittensBroker&) = delete;
+    __host__ KittensBroker& operator=(const KittensBroker&) = delete;
 
     __host__ inline KittensBroker(KittensBroker&& other) noexcept
         : local_rank_(other.local_rank_),
