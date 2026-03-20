@@ -1,0 +1,64 @@
+{
+  "4096": [
+    {
+      "B": 2,
+      "H": 4,
+      "label": "B=2,H=4",
+      "pytorch_bwd_ms": null,
+      "pytorch_only_ms": null,
+      "tk_fused_ms": null,
+      "speedup_vs_bwd": null,
+      "speedup_vs_only": null
+    },
+    {
+      "B": 4,
+      "H": 8,
+      "label": "B=4,H=8",
+      "pytorch_bwd_ms": null,
+      "pytorch_only_ms": null,
+      "tk_fused_ms": null,
+      "speedup_vs_bwd": null,
+      "speedup_vs_only": null
+    },
+    {
+      "B": 8,
+      "H": 16,
+      "label": "B=8,H=16",
+      "pytorch_bwd_ms": null,
+      "pytorch_only_ms": null,
+      "tk_fused_ms": null,
+      "speedup_vs_bwd": null,
+      "speedup_vs_only": null
+    },
+    {
+      "B": 16,
+      "H": 16,
+      "label": "B=16,H=16",
+      "pytorch_bwd_ms": null,
+      "pytorch_only_ms": null,
+      "tk_fused_ms": null,
+      "speedup_vs_bwd": null,
+      "speedup_vs_only": null
+    },
+    {
+      "B": 32,
+      "H": 4,
+      "label": "B=32,H=4",
+      "pytorch_bwd_ms": null,
+      "pytorch_only_ms": null,
+      "tk_fused_ms": null,
+      "speedup_vs_bwd": null,
+      "speedup_vs_only": null
+    },
+    {
+      "B": 32,
+      "H": 16,
+      "label": "B=32,H=16",
+      "pytorch_bwd_ms": null,
+      "pytorch_only_ms": null,
+      "tk_fused_ms": null,
+      "speedup_vs_bwd": null,
+      "speedup_vs_only": null
+    }
+  ]
+}
