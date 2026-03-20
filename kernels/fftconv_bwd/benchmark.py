@@ -114,19 +114,18 @@ def prepare_fused_inputs(u, k, dy, B, H, N, N1):
 
 def bench_pytorch_autograd(B, H, N, num_iters=50, warmup=10):
     """PyTorch FFT conv forward + backward via autograd."""
-    u = torch.randn(B, H, N, device='cuda', dtype=torch.float32, requires_grad=True) / H
-    k = torch.randn(H, N, device='cuda', dtype=torch.float32, requires_grad=True) / H
+    u_data = torch.randn(B, H, N, device='cuda', dtype=torch.float32) / H
+    k_data = torch.randn(H, N, device='cuda', dtype=torch.float32) / H
     dy = torch.randn(B, H, N, device='cuda', dtype=torch.float32) / H
 
     def run():
+        u = u_data.detach().requires_grad_(True)
+        k = k_data.detach().requires_grad_(True)
         u_f = torch.fft.fft(u, n=N)
         k_f = torch.fft.fft(k, n=N)
         y = torch.fft.ifft(u_f * k_f, n=N).real
         loss = (y * dy).sum()
         loss.backward()
-        # Clear grads for next iter
-        u.grad = None
-        k.grad = None
 
     # Warmup
     for _ in range(warmup):
