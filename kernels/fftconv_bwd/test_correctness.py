@@ -117,12 +117,17 @@ def prepare_dkf_inputs(u, dy, B, H, N, N1):
 
     Uses the actual (non-conjugated) FFT matrix and twiddle,
     since both dy and u go through the same forward FFT.
+
+    IMPORTANT: twiddle is NOT normalized by 1/N here. In the forward pass,
+    tw includes 1/N to normalize the FFT-IFFT pair. But for dk_f, both
+    inputs go through FFT independently — using 1/N on both would give 1/N^2.
+    We use unnormalized twiddles and let the test comparison account for it.
     """
     f_mat = fft_matrix(N1)
     f_real = f_mat.real.to(torch.bfloat16).contiguous()
     f_imag = f_mat.imag.to(torch.bfloat16).contiguous()
 
-    tw = compute_twiddle_factors_fft(N1, N1) / N
+    tw = compute_twiddle_factors_fft(N1, N1)  # no /N for dk_f
     tw_real = tw.real.to(torch.bfloat16).contiguous()
     tw_imag = tw.imag.to(torch.bfloat16).contiguous()
 
@@ -215,8 +220,10 @@ def test_dkf(B, H, N, N1):
 
     # Reference: dk in time domain
     _, dk_ref = ref_fftconv_bwd(u, k, dy, N)
-    # Convert to permuted frequency domain (same as monarch backward)
-    dk_f_ref = torch.fft.fft(dk_ref.float(), n=N) / N
+    # Convert to permuted frequency domain.
+    # With unnormalized twiddles, the kernel computes FFT(dy) * conj(FFT(u))
+    # = FFT(dk) (no 1/N factor). So the reference is FFT(dk) permuted.
+    dk_f_ref = torch.fft.fft(dk_ref.float(), n=N)
     dk_f_permuted_ref = (dk_f_ref.reshape(H, N1, N1)
                            .transpose(-1, -2)
                            .reshape(H, N))
@@ -248,10 +255,11 @@ def test_dkf(B, H, N, N1):
         dk_f_imag_out.float().sum(dim=0)
     ).reshape(H, N)
 
-    # Compare
-    diff = (dk_f_out.float() - dk_f_permuted_ref.float().cuda()).abs()
+    # Compare (both are complex — use complex abs for magnitude of difference)
+    dk_f_ref_gpu = dk_f_permuted_ref.cuda()
+    diff = (dk_f_out - dk_f_ref_gpu).abs()  # complex abs = magnitude
     max_abs = diff.max().item()
-    max_rel = max_abs / dk_f_permuted_ref.float().abs().max().item()
+    max_rel = max_abs / dk_f_ref_gpu.abs().max().item()
 
     print(f"dk_f max abs error: {max_abs:.6e}")
     print(f"dk_f max rel error: {max_rel:.6e}")
