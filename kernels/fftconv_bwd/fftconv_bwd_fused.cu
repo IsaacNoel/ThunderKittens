@@ -329,7 +329,7 @@ std::vector<at::Tensor> fftconv_bwd_fused(
     return {du_out, dk_f_r_out.squeeze(0), dk_f_i_out.squeeze(0)};
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+PYBIND11_MODULE(_C_fused, m) {
     m.def("fftconv_bwd_fused", fftconv_bwd_fused,
         "Fused FFTConv backward (du + dk_f). Single kernel, no LCSF. "
         "Returns (du, dk_f_real, dk_f_imag). dk_f is already summed over batch.");
