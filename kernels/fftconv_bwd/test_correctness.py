@@ -55,6 +55,36 @@ def compute_twiddle_factors_ifft(n, m):
 
 
 # ============================================================================
+# Tile helpers for N=1024 (N1=32)
+#
+# The kernel always uses 64x64 shared memory tiles. For N=1024, 4 batch
+# elements (each a 32x32 subtile) are packed into one 64x64 tile.
+# Matrix arguments must therefore always be 64x64:
+#   - F/Finv (matrix multiplies): block_diag(M_32, M_32) applies M_32
+#     independently to each row-block / column-block of the 64x64 tile.
+#   - Twiddles and per-head filters (pointwise): tile M_32 in all 4 quadrants
+#     so the same values are applied to every batch subtile.
+# ============================================================================
+
+KERNEL_TILE = 64
+
+def to_tile_block_diag(mat):
+    """Lift an N1xN1 matrix to 64x64 for left/right matrix multiplies."""
+    if mat.shape[-1] == KERNEL_TILE:
+        return mat
+    return torch.block_diag(mat, mat)
+
+def to_tile_pointwise(mat):
+    """Lift an N1xN1 (or HxN1xN1) matrix to 64x64 (or Hx64x64) for pointwise ops."""
+    if mat.shape[-1] == KERNEL_TILE:
+        return mat
+    if mat.dim() == 2:
+        return mat.repeat(2, 2)          # (N1,N1) -> (64,64)
+    else:
+        return mat.repeat(1, 2, 2)       # (H,N1,N1) -> (H,64,64)
+
+
+# ============================================================================
 # Prepare kernel inputs for du backward
 # ============================================================================
 
@@ -66,18 +96,21 @@ def prepare_du_inputs(u, k, dy, B, H, N, N1):
         kf slot      <- conj(kf)
         twinv_t slot <- conj(tw)
     """
-    # FFT / IFFT matrices
-    f_mat = fft_matrix(N1)
+    # FFT / IFFT matrices — must be 64x64 for the kernel tile size.
+    # For N1=32 (N=1024), use block_diag so F_32 applies independently to
+    # each of the 4 batch subtiles packed into the 64x64 shared tile.
+    f_mat = to_tile_block_diag(fft_matrix(N1))
     f_real = f_mat.real.to(torch.bfloat16).contiguous()
     f_imag = f_mat.imag.to(torch.bfloat16).contiguous()
 
-    finv_mat = ifft_matrix(N1)
+    finv_mat = to_tile_block_diag(ifft_matrix(N1))
     finv_real = finv_mat.real.to(torch.bfloat16).contiguous()
     finv_imag = finv_mat.imag.to(torch.bfloat16).contiguous()
 
-    # Twiddle factors (forward uses tw with 1/N normalization)
-    tw = compute_twiddle_factors_fft(N1, N1) / N
-    twinv = compute_twiddle_factors_ifft(N1, N1)
+    # Twiddle factors — pointwise, so tile the same N1xN1 values across all
+    # 4 quadrants of the 64x64 tile (all batch subtiles share the same twiddle).
+    tw = to_tile_pointwise(compute_twiddle_factors_fft(N1, N1) / N)
+    twinv = to_tile_pointwise(compute_twiddle_factors_ifft(N1, N1))
 
     # For the du backward kernel:
     #   tw_bwd      = conj(twinv_t) — twinv_t is pre-transposed in forward,
@@ -93,10 +126,10 @@ def prepare_du_inputs(u, k, dy, B, H, N, N1):
     twinv_t_bwd_real = twinv_t_bwd.real.to(torch.bfloat16).contiguous()
     twinv_t_bwd_imag = twinv_t_bwd.imag.to(torch.bfloat16).contiguous()
 
-    # Filter: conj(kf)
+    # Filter: conj(kf) — pointwise per head, tile to (H, 64, 64).
     k_f = torch.fft.fft(k.float(), n=N)
     k_fT = k_f.reshape(H, N1, N1).transpose(-1, -2)
-    kf_conj = k_fT.conj()
+    kf_conj = to_tile_pointwise(k_fT.conj())
     kf_conj_real = kf_conj.real.to(torch.bfloat16).contiguous()
     kf_conj_imag = kf_conj.imag.to(torch.bfloat16).contiguous()
 
@@ -123,11 +156,13 @@ def prepare_dkf_inputs(u, dy, B, H, N, N1):
     inputs go through FFT independently — using 1/N on both would give 1/N^2.
     We use unnormalized twiddles and let the test comparison account for it.
     """
-    f_mat = fft_matrix(N1)
+    # F matrix: block_diag for N1=32 so it applies independently to each subtile.
+    f_mat = to_tile_block_diag(fft_matrix(N1))
     f_real = f_mat.real.to(torch.bfloat16).contiguous()
     f_imag = f_mat.imag.to(torch.bfloat16).contiguous()
 
-    tw = compute_twiddle_factors_fft(N1, N1)  # no /N for dk_f
+    # Twiddle: tile across all 4 quadrants (same twiddle for all batch subtiles).
+    tw = to_tile_pointwise(compute_twiddle_factors_fft(N1, N1))  # no /N for dk_f
     tw_real = tw.real.to(torch.bfloat16).contiguous()
     tw_imag = tw.imag.to(torch.bfloat16).contiguous()
 
