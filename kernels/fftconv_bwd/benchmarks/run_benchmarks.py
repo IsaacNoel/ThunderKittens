@@ -140,12 +140,23 @@ def bench_tk(B, H, N, N1):
 # ── Main suite ────────────────────────────────────────────────────────────────
 
 CONFIGS = [
+    # Small batch — GPU underutilized, measures kernel overhead
     (2,  4,  "B=2,H=4"),
     (4,  8,  "B=4,H=8"),
     (8,  16, "B=8,H=16"),
+    # Medium batch — representative of real training
     (16, 16, "B=16,H=16"),
+    (8,  32, "B=8,H=32"),
+    (16, 32, "B=16,H=32"),
+    # Large batch — GPU fully loaded, HBM bandwidth bound
     (32, 4,  "B=32,H=4"),
     (32, 16, "B=32,H=16"),
+    (32, 32, "B=32,H=32"),
+    (4,  64, "B=4,H=64"),
+    # B=64 — large batch, tests scaling beyond 32
+    (64, 4,  "B=64,H=4"),
+    (64, 16, "B=64,H=16"),
+    (64, 32, "B=64,H=32"),
 ]
 
 SEQ_LENGTHS = [1024, 4096]  # N must be N1^2 for Monarch decomposition
