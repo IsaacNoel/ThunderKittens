@@ -4,9 +4,9 @@
 
 This PR adds a CUDA backward pass for FFT convolution using ThunderKittens primitives, mirroring the existing forward kernel in `kernels/fftconv/`. The backward kernel computes both the input gradient (`du`) and filter gradient (`dk_f`) for the Monarch-decomposed FFT convolution, enabling end-to-end training of models that use this operation.
 
-Two kernel variants are provided:
-1. **Separate kernels** (`fftconv_bwd_pc.cu`): `du` and `dk_f` as independent LCSF producer-consumer kernels
-2. **Fused kernel** (`fftconv_bwd_fused.cu`): Both gradients computed in a single kernel launch
+The backward pass is implemented as two LCSF producer-consumer kernels in `fftconv_bwd_pc.cu`:
+- `fftconv_bwd`: computes the input gradient `du`
+- `fftconv_bwd_dkf`: computes the filter gradient `dk_f`
 
 ## Mathematical Basis
 
@@ -62,13 +62,11 @@ Both dy and u go through the same Monarch FFT (`F @ x → ⊙ tw → @ F`), then
 
 1. **Reusing forward structure for du**: Rather than implementing the adjoint from scratch, the du kernel reuses the forward kernel's compute pipeline verbatim. Conjugation is done Python-side, eliminating code duplication and ensuring the backward tracks any future forward changes.
 
-2. **Separate vs fused kernels**: The separate kernel (`fftconv_bwd_pc.cu`) uses LCSF for maximum I/O overlap but requires two kernel launches. The fused kernel (`fftconv_bwd_fused.cu`) computes both du and dk_f in one pass without LCSF, trading pipeline depth for reduced launch overhead and elimination of the redundant FFT(dy) computation.
+2. **dk_f batch reduction**: `fftconv_bwd_dkf` outputs per-batch partials and reduces them to `dk_f[h]` in float32 on the Python side. Float32 reduction avoids bf16 precision loss for large batch sizes.
 
-3. **dk_f batch reduction strategy**: The separate dk_f kernel outputs per-batch partials and reduces in float32 on the Python side. The fused kernel accumulates in bf16 shared memory on-device. The separate approach is more precise; the fused approach has lower latency.
+3. **Persistent grid (132 blocks)**: Both kernels use a persistent grid of 132 blocks (matching H100 SM count), iterating over heads and batches. This amortizes kernel launch overhead across many heads.
 
-4. **Persistent grid (132 blocks)**: Both kernels use a persistent grid of 132 blocks (matching H100 SM count), iterating over heads and batches. This amortizes kernel launch overhead for many heads.
-
-5. **1024 vs 4096 variants**: The 1024 variant packs 4 batch elements as 32×32 subtiles within each 64×64 shared tile; the 4096 variant uses TMA for full 64×64 tile transfers. Only the 4096 variant has a dk_f kernel.
+4. **1024 vs 4096 variants**: The 1024 variant packs 4 batch elements as 32×32 subtiles within each 64×64 shared tile; the 4096 variant uses TMA for full 64×64 tile transfers. Both N=1024 and N=4096 are supported for du and dk_f.
 
 ## Correctness Verification
 
@@ -88,15 +86,13 @@ See `CHANGES.md` for full details.
 
 ## Performance Characteristics
 
-The TK backward kernel:
-- Uses identical compute structure to the forward (7 steps: 4 matrix multiplies + 3 pointwise ops)
-- The fused variant does 14 matrix multiplies per (batch, head) pair: 7 for du + 7 for dk_f (FFT of dy reused)
-- The separate variant does 7 + 7 matrix multiplies but with full LCSF pipeline overlap
-- Shared memory: ~136KB for fused, within H100's 227KB limit
-- Register pressure: 232 registers per consumer warp (increased from default)
+The TK backward kernels:
+- Use identical compute structure to the forward (7 steps: 4 matrix multiplies + 3 pointwise ops)
+- du and dk_f together do 14 matrix multiplies per (batch, head) pair with full LCSF pipeline overlap
+- Shared memory: ~224KB peak (2 pipeline stages for dk_f 1024 variant), within H100's 227KB limit
 
 Benchmark infrastructure is in `benchmarks/run_benchmarks.py` — requires H100 GPU for actual
-timing. Results saved to `benchmarks/benchmark_results.json` and `benchmarks/benchmark_N4096.png`.
+timing. Results saved to `benchmarks/benchmark_results.json` and PNG plots per sequence length.
 
 ### Input Validation
 
@@ -107,8 +103,4 @@ validation style. Validates N (1024 or 4096), N1*N1==N, tensor shapes, and matri
 
 1. **Forward kernel 1024 bug**: The forward kernel (`fftconv/fftconv_pc.cu`, line 139) has the same `iters_per_head` bug as the backward's 1024 variant. The backward's copy was fixed but the forward was not modified per project rules.
 
-2. **bf16 dk_f accumulation**: The fused kernel's on-device bf16 accumulation may produce slightly different results than the separate kernel's float32 reduction for large batch sizes. Both are within the 5% tolerance.
-
-3. **No causal mode**: The current implementation handles non-causal FFT convolution only. The forward kernel also appears non-causal for the tile-level operation; causal masking would be applied at a higher level.
-
-4. **N=1024 dk_f**: There is no dk_f kernel for the 1024 variant — only the 4096 variant has a dk_f implementation in the LCSF framework.
+2. **No causal mode**: The current implementation handles non-causal FFT convolution only. The forward kernel also appears non-causal for the tile-level operation; causal masking would be applied at a higher level.

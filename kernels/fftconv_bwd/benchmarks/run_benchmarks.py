@@ -1,23 +1,11 @@
 """
 Benchmark: FFTConv backward pass — TK kernels vs PyTorch reference
 
-Compares three implementations:
+Compares two implementations:
   1. PyTorch autograd backward (baseline)
   2. TK two-kernel: separate fftconv_bwd (du) + fftconv_bwd_dkf (dk_f)
-  3. TK fused: fftconv_bwd_fused (du + dk_f in one kernel launch)
 
-To get a full comparison graph, build both variants first:
-    cd kernels/fftconv_bwd
-    make                          # builds _C.so (two-kernel version)
-    cp _C*.so benchmarks/         # stash two-kernel .so
-    make fused                    # rebuilds _C.so (fused version)
-    cp _C*.so benchmarks/         # stash fused .so
-
-Or use the Makefile targets:
-    make benchmark                # two-kernel build + benchmark
-    make benchmark-fused          # fused build + benchmark
-
-Usage (single run):
+Usage:
     cd kernels/fftconv_bwd && make
     python benchmarks/run_benchmarks.py
 """
@@ -38,14 +26,6 @@ try:
 except ImportError:
     HAS_TK_SEPARATE = False
     print("INFO: TK two-kernel not in _C (build with 'make' to enable)")
-
-try:
-    from _C import fftconv_bwd_fused
-    HAS_TK_FUSED = True
-    print("Loaded: TK fused (fftconv_bwd_fused)")
-except ImportError:
-    HAS_TK_FUSED = False
-    print("INFO: TK fused not in _C (build with 'make fused' to enable)")
 
 
 # ── Matrix / twiddle helpers ──────────────────────────────────────────────────
@@ -69,17 +49,13 @@ def compute_twiddle_factors_ifft(n, m):
     return torch.exp(2j * torch.pi * n_a * m_a / (n * m))
 
 def to_tile_block_diag(mat):
-    """Lift N1xN1 matrix to 64x64 for left/right matrix multiplies.
-    For N1=32 (N=1024): block_diag(M, M) applies M independently to each
-    of the 4 batch subtiles packed into the 64x64 shared tile."""
+    """Lift N1xN1 matrix to 64x64 for left/right matrix multiplies."""
     if mat.shape[-1] == KERNEL_TILE:
         return mat
     return torch.block_diag(mat, mat)
 
 def to_tile_pointwise(mat):
-    """Lift N1xN1 (or HxN1xN1) matrix to 64x64 (or Hx64x64) for pointwise ops.
-    For N1=32: tiles the same values across all 4 quadrants so every batch
-    subtile sees the same twiddle / filter."""
+    """Lift N1xN1 (or HxN1xN1) matrix to 64x64 (or Hx64x64) for pointwise ops."""
     if mat.shape[-1] == KERNEL_TILE:
         return mat
     return mat.repeat(2, 2) if mat.dim() == 2 else mat.repeat(1, 2, 2)
@@ -88,7 +64,7 @@ bf16_cuda = lambda t: t.to(torch.bfloat16).contiguous().cuda()
 
 
 def prepare_du_inputs(u, k, dy, B, H, N, N1):
-    """Inputs for the two-kernel du backward."""
+    """Inputs for the du backward kernel."""
     f_mat    = to_tile_block_diag(fft_matrix(N1))
     finv_mat = to_tile_block_diag(ifft_matrix(N1))
     tw       = to_tile_pointwise(compute_twiddle_factors_fft(N1, N1) / N)
@@ -109,34 +85,14 @@ def prepare_du_inputs(u, k, dy, B, H, N, N1):
     )
 
 def prepare_dkf_inputs(u, dy, B, H, N, N1):
-    """Inputs for the two-kernel dk_f backward."""
+    """Inputs for the dk_f backward kernel."""
     f_mat = to_tile_block_diag(fft_matrix(N1))
-    tw    = to_tile_pointwise(compute_twiddle_factors_fft(N1, N1))  # no /N
+    tw    = to_tile_pointwise(compute_twiddle_factors_fft(N1, N1))
     return (
         bf16_cuda(dy.reshape(B, H, N1, N1)),
         bf16_cuda(u.reshape(B, H, N1, N1)),
         bf16_cuda(f_mat.real), bf16_cuda(f_mat.imag),
         bf16_cuda(tw.real),    bf16_cuda(tw.imag),
-    )
-
-def prepare_fused_inputs(u, k, dy, B, H, N, N1):
-    """Inputs for the fused backward kernel."""
-    f_mat    = to_tile_block_diag(fft_matrix(N1))
-    finv_mat = to_tile_block_diag(ifft_matrix(N1))
-    tw       = to_tile_pointwise(compute_twiddle_factors_fft(N1, N1))
-    tw_fwd   = to_tile_pointwise(compute_twiddle_factors_fft(N1, N1) / N)
-    twinv_bwd = tw_fwd.conj()
-    k_f  = torch.fft.fft(k.float(), n=N)
-    k_fT = k_f.reshape(H, N1, N1).transpose(-1, -2)
-    kf_conj = to_tile_pointwise(k_fT.conj())
-    return (
-        bf16_cuda(dy.reshape(B, H, N1, N1)),
-        bf16_cuda(u.reshape(B, H, N1, N1)),
-        bf16_cuda(kf_conj.real),  bf16_cuda(kf_conj.imag),
-        bf16_cuda(f_mat.real),    bf16_cuda(f_mat.imag),
-        bf16_cuda(finv_mat.real), bf16_cuda(finv_mat.imag),
-        bf16_cuda(tw.real),       bf16_cuda(tw.imag),
-        bf16_cuda(twinv_bwd.real),bf16_cuda(twinv_bwd.imag),
     )
 
 
@@ -167,7 +123,7 @@ def bench_pytorch(B, H, N):
     return _time_fn(run)
 
 
-def bench_tk_separate(B, H, N, N1):
+def bench_tk(B, H, N, N1):
     if not HAS_TK_SEPARATE:
         return float('nan')
     u  = torch.randn(B, H, N, device='cuda').float() / H
@@ -178,20 +134,6 @@ def bench_tk_separate(B, H, N, N1):
     def run():
         fftconv_bwd(*du_args, B, H, N, N1)
         fftconv_bwd_dkf(*dkf_args, B, H, N, N1)
-    return _time_fn(run)
-
-
-def bench_tk_fused(B, H, N, N1):
-    if not HAS_TK_FUSED:
-        return float('nan')
-    if N != 4096:  # fused kernel only supports N=4096
-        return float('nan')
-    u  = torch.randn(B, H, N, device='cuda').float() / H
-    k  = torch.randn(H, N,    device='cuda').float() / H
-    dy = torch.randn(B, H, N, device='cuda').float() / H
-    args = prepare_fused_inputs(u, k, dy, B, H, N, N1)
-    def run():
-        fftconv_bwd_fused(*args, B, H, N, N1)
     return _time_fn(run)
 
 
@@ -214,22 +156,19 @@ def run_all():
     for N in SEQ_LENGTHS:
         N1 = int(N ** 0.5)
         assert N1 * N1 == N, f"N={N} is not a perfect square"
-        print(f"\n{'='*72}\nN={N} (N1={N1})\n{'='*72}")
-        hdr = f"{'Config':>12} | {'PyTorch':>10} | {'TK separate':>12} | {'TK fused':>10} | {'Sep 1x':>8} | {'Fused 1x':>8}"
+        print(f"\n{'='*60}\nN={N} (N1={N1})\n{'='*60}")
+        hdr = f"{'Config':>12} | {'PyTorch':>10} | {'TK':>10} | {'Speedup':>8}"
         print(hdr); print("-" * len(hdr))
         results[N] = []
         for B, H, label in CONFIGS:
-            pt   = bench_pytorch(B, H, N)
-            sep  = bench_tk_separate(B, H, N, N1)
-            fused = bench_tk_fused(B, H, N, N1)
-            sp_sep   = pt / sep   if not np.isnan(sep)   and sep   > 0 else float('nan')
-            sp_fused = pt / fused if not np.isnan(fused) and fused > 0 else float('nan')
+            pt = bench_pytorch(B, H, N)
+            tk = bench_tk(B, H, N, N1)
+            sp = pt / tk if not np.isnan(tk) and tk > 0 else float('nan')
             fmt = lambda v: f"{v:.3f}ms" if not np.isnan(v) else "   N/A  "
             fmx = lambda v: f"{v:.2f}x"  if not np.isnan(v) else "  N/A"
-            print(f"{label:>12} | {fmt(pt):>10} | {fmt(sep):>12} | {fmt(fused):>10} | {fmx(sp_sep):>8} | {fmx(sp_fused):>8}")
+            print(f"{label:>12} | {fmt(pt):>10} | {fmt(tk):>10} | {fmx(sp):>8}")
             results[N].append(dict(label=label, B=B, H=H,
-                                   pytorch_ms=pt, tk_separate_ms=sep, tk_fused_ms=fused,
-                                   speedup_separate=sp_sep, speedup_fused=sp_fused))
+                                   pytorch_ms=pt, tk_ms=tk, speedup=sp))
     return results
 
 
@@ -244,26 +183,23 @@ def plot(results):
         print("matplotlib not available — skipping plots"); return
 
     out_dir = os.path.dirname(os.path.abspath(__file__))
-    colors = {'PyTorch': '#4ECDC4', 'TK separate': '#FF6B6B', 'TK fused': '#F7DC6F'}
 
     for N, rows in results.items():
         labels = [r['label'] for r in rows]
-        x = np.arange(len(labels)); w = 0.25
+        x = np.arange(len(labels)); w = 0.35
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
         fig.suptitle(f'FFTConv Backward — N={N}', fontsize=13, fontweight='bold')
 
         # Absolute times
-        ax1.bar(x - w, [r['pytorch_ms']     for r in rows], w, label='PyTorch',     color=colors['PyTorch'])
-        ax1.bar(x,     [r['tk_separate_ms'] for r in rows], w, label='TK separate', color=colors['TK separate'])
-        ax1.bar(x + w, [r['tk_fused_ms']    for r in rows], w, label='TK fused',    color=colors['TK fused'])
+        ax1.bar(x - w/2, [r['pytorch_ms'] for r in rows], w, label='PyTorch', color='#4ECDC4')
+        ax1.bar(x + w/2, [r['tk_ms']      for r in rows], w, label='TK',      color='#FF6B6B')
         ax1.set_ylabel('Latency (ms)'); ax1.set_title('Absolute latency')
         ax1.set_xticks(x); ax1.set_xticklabels(labels, rotation=30, ha='right')
         ax1.legend(); ax1.grid(axis='y', alpha=0.3)
 
         # Speedup over PyTorch
-        ax2.bar(x - w/2, [r['speedup_separate'] for r in rows], w, label='TK separate', color=colors['TK separate'])
-        ax2.bar(x + w/2, [r['speedup_fused']    for r in rows], w, label='TK fused',    color=colors['TK fused'])
+        ax2.bar(x, [r['speedup'] for r in rows], w*2, color='#FF6B6B', label='TK speedup')
         ax2.axhline(1, color='gray', linestyle='--', alpha=0.5, label='PyTorch baseline')
         ax2.set_ylabel('Speedup vs PyTorch'); ax2.set_title('Speedup')
         ax2.set_xticks(x); ax2.set_xticklabels(labels, rotation=30, ha='right')

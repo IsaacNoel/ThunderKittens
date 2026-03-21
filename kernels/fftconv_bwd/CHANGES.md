@@ -1,5 +1,23 @@
 # fftconv_bwd — Change Log
 
+## Phase 7: Remove fused kernel
+
+**Removed files:** `fftconv_bwd_fused.cu`, `test_correctness_fused.py`
+
+**Reason:** The fused kernel (`fftconv_bwd_fused.cu`) combined du and dk_f into a single
+kernel launch with the goal of reducing launch overhead and eliminating redundant FFT(dy)
+computation. In practice it was slower than the separate two-kernel path due to extremely
+high register pressure (157 registers/thread at compile time), which limited SM occupancy
+and reduced the GPU's ability to hide memory latency. The separate kernels each run with
+better occupancy and full LCSF pipeline overlap.
+
+The fused approach could be revisited in the future if register pressure can be reduced,
+or if the kernel is fused with adjacent operations (e.g., attention layer above it).
+
+**Also removed:**
+- Fused targets from `Makefile` (`fused`, `test-fused`, `benchmark-fused`)
+- Fused columns and imports from `benchmarks/run_benchmarks.py`
+
 ## Phase 6: N=1024 support for dk_f kernel
 
 ### New: fft_dkf_1024_template (filter gradient for N=1024)
@@ -76,34 +94,25 @@ bug in its 1024 variant. That file was not modified per project rules.
 `FFT(dy) * conj(FFT(u))` per batch element using unnormalized Monarch FFT.
 Batch reduction (sum over B) is performed Python-side in float32 for precision.
 
-**Fused kernel (fftconv_bwd_fused.cu):** Correctly combines du and dk_f in a single
-kernel launch. Uses unnormalized `tw` for FFT steps (valid since `conj(twinv_t) = tw`
-for unnormalized twiddles). dk_f accumulator is bf16 in shared memory — acceptable for
-moderate batch sizes, but may lose precision for very large B.
-
-**Shared memory aliasing:** Verified that `input_tile`, `fft_dy_save`, `dk_f_acc`, and
-`tmp` in the fused kernel are never written/read concurrently across phases. All phase
-transitions are guarded by `__syncthreads()`.
-
 ## Phase 3: Code Quality
 
 ### Input validation (matching fftconv forward style)
 
-**Files:** `fftconv_bwd_pc.cu`, `fftconv_bwd_fused.cu`
+**File:** `fftconv_bwd_pc.cu`
 
 Added `TORCH_CHECK` assertions to all PyTorch binding functions:
 - `fftconv_bwd`: validates N (1024 or 4096), N1*N1==N, dy shape, matrix dimensions (64x64)
-- `fftconv_bwd_dkf`: validates N==4096, N1==64, dy/u shapes, matrix dimensions
-- `fftconv_bwd_fused`: validates N==4096, N1==64, dy/u shapes, matrix dimensions
+- `fftconv_bwd_dkf`: validates N (1024 or 4096), N1*N1==N, dy/u shapes, matrix dimensions
 
 Matches the validation style of `kernels/fftconv/fftconv_pc.cu` (forward kernel).
 
 ## Phase 4: Benchmarks
 
-Benchmark infrastructure already existed in `benchmarks/run_benchmarks.py`. No changes needed.
+Benchmark infrastructure in `benchmarks/run_benchmarks.py`.
 
-The script benchmarks TK fused backward kernel vs PyTorch autograd backward for N=4096
-across 6 configurations (B=2..32, H=4..16). Results are saved as JSON and PNG.
+The script benchmarks the TK two-kernel backward (du + dk_f) vs PyTorch autograd for
+both N=1024 and N=4096 across 6 configurations (B=2..32, H=4..16). Results are saved
+as JSON and PNG plots.
 
 Note: The requested sequence lengths (768, 1536, 3072, 6144, 12288) are not supported by
 the Monarch decomposition (requires N = N1^2, a perfect square). Supported sizes: 1024, 4096.
