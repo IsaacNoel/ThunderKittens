@@ -448,7 +448,8 @@ template <typename T> __host__ void check(
 
 template <bool CLUSTER = false, bool PDL = false>
 struct LaunchConfig {
-    static constexpr unsigned int num_attributes = CLUSTER ? (PDL ? 3 : 2) : 1;
+    // CUDA 12.6 removed cudaLaunchAttributePreferredClusterDimension — use only ClusterDimension
+    static constexpr unsigned int num_attributes = CLUSTER ? (PDL ? 2 : 1) : 1;
 
     cudaLaunchAttribute attributes[num_attributes];
     cudaLaunchConfig_t config = {0};
@@ -471,17 +472,15 @@ struct LaunchConfig {
 
     __host__ inline LaunchConfig(dim3 grid, dim3 block, size_t dynamic_shared_memory, 
                                  cudaStream_t stream, dim3 cluster_preferred, dim3 cluster_minimum) noexcept requires(CLUSTER) {
-        attributes[0].id = cudaLaunchAttributePreferredClusterDimension;
-        attributes[0].val.preferredClusterDim.x = cluster_preferred.x;
-        attributes[0].val.preferredClusterDim.y = cluster_preferred.y;
-        attributes[0].val.preferredClusterDim.z = cluster_preferred.z;
-        attributes[1].id = cudaLaunchAttributeClusterDimension;
-        attributes[1].val.clusterDim.x = cluster_minimum.x;
-        attributes[1].val.clusterDim.y = cluster_minimum.y;
-        attributes[1].val.clusterDim.z = cluster_minimum.z;
+        // cudaLaunchAttributePreferredClusterDimension removed in CUDA 12.6+
+        // Use cluster_minimum as the hard requirement; preferred hint is dropped.
+        attributes[0].id = cudaLaunchAttributeClusterDimension;
+        attributes[0].val.clusterDim.x = cluster_minimum.x;
+        attributes[0].val.clusterDim.y = cluster_minimum.y;
+        attributes[0].val.clusterDim.z = cluster_minimum.z;
         if constexpr (PDL) {
-            attributes[2].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-            attributes[2].val.programmaticStreamSerializationAllowed = 1;
+            attributes[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attributes[1].val.programmaticStreamSerializationAllowed = 1;
         }
         config.attrs = attributes;
         config.numAttrs = num_attributes;
