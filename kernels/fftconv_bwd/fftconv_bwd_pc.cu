@@ -971,11 +971,26 @@ std::vector<at::Tensor> fftconv_bwd_dkf(
     TORCH_CHECK(f_real.size(0) == 64 && f_real.size(1) == 64, "f_real must be 64x64");
     TORCH_CHECK(tw_real.size(0) == 64 && tw_real.size(1) == 64, "tw_real must be 64x64");
 
-    at::Tensor dk_f_real = at::empty({B, H, N1, N1}, dy_real.options());
-    at::Tensor dk_f_imag = at::empty({B, H, N1, N1}, dy_real.options());
+    // For N=1024 the producer packs 4 batches per 64x64 shared tile.  When B
+    // is not a multiple of 4, the unused subtile slots in shared memory are
+    // uninitialised and may contain NaN from a prior kernel.  IEEE arithmetic
+    // gives 0.0 * NaN = NaN, so those values bleed through the block-diagonal
+    // WGMMA multiply and corrupt the stored outputs.  Zero-pad inputs to the
+    // next multiple of 4 so every slot is clean; slice the output back to B.
+    int B_kern = B;
+    at::Tensor dy_in = dy_real, u_in = u_real;
+    if (N == 1024 && (B % 4) != 0) {
+        B_kern = ((B + 3) / 4) * 4;
+        auto pad = at::zeros({B_kern - B, H, N1, N1}, dy_real.options());
+        dy_in = at::cat({dy_real, pad}, 0).contiguous();
+        u_in  = at::cat({u_real,  pad}, 0).contiguous();
+    }
 
-    bf16 *d_dy  = reinterpret_cast<bf16*>(dy_real.data_ptr<c10::BFloat16>());
-    bf16 *d_u   = reinterpret_cast<bf16*>(u_real.data_ptr<c10::BFloat16>());
+    at::Tensor dk_f_real = at::empty({B_kern, H, N1, N1}, dy_real.options());
+    at::Tensor dk_f_imag = at::empty({B_kern, H, N1, N1}, dy_real.options());
+
+    bf16 *d_dy  = reinterpret_cast<bf16*>(dy_in.data_ptr<c10::BFloat16>());
+    bf16 *d_u   = reinterpret_cast<bf16*>(u_in.data_ptr<c10::BFloat16>());
     bf16 *d_dkr = reinterpret_cast<bf16*>(dk_f_real.data_ptr<c10::BFloat16>());
     bf16 *d_dki = reinterpret_cast<bf16*>(dk_f_imag.data_ptr<c10::BFloat16>());
     bf16 *d_f_r = reinterpret_cast<bf16*>(f_real.data_ptr<c10::BFloat16>());
@@ -984,11 +999,17 @@ std::vector<at::Tensor> fftconv_bwd_dkf(
     bf16 *d_tw_i = reinterpret_cast<bf16*>(tw_imag.data_ptr<c10::BFloat16>());
 
     if (N == 4096) {
-        auto G = setup_dkf_globals<4096>(d_dkr, d_dki, d_dy, d_u, d_f_r, d_f_i, d_tw_r, d_tw_i, B, H);
+        auto G = setup_dkf_globals<4096>(d_dkr, d_dki, d_dy, d_u, d_f_r, d_f_i, d_tw_r, d_tw_i, B_kern, H);
         launch_dkf<4096>(G);
     } else {
-        auto G = setup_dkf_globals<1024>(d_dkr, d_dki, d_dy, d_u, d_f_r, d_f_i, d_tw_r, d_tw_i, B, H);
+        auto G = setup_dkf_globals<1024>(d_dkr, d_dki, d_dy, d_u, d_f_r, d_f_i, d_tw_r, d_tw_i, B_kern, H);
         launch_dkf<1024>(G);
+    }
+
+    // Slice output back to original B if we padded
+    if (B_kern != B) {
+        dk_f_real = dk_f_real.slice(0, 0, B);
+        dk_f_imag = dk_f_imag.slice(0, 0, B);
     }
 
     CHECK_CUDA_ERROR(cudaGetLastError());
