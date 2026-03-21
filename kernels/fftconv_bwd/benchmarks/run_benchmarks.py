@@ -1,41 +1,56 @@
 """
-Benchmark: FFTConv backward pass — TK kernel vs PyTorch reference
+Benchmark: FFTConv backward pass — TK kernels vs PyTorch reference
 
-Benchmarks both causal and non-causal modes across multiple sequence lengths.
-Generates PNG graphs to benchmarks/ directory.
+Compares three implementations:
+  1. PyTorch autograd backward (baseline)
+  2. TK two-kernel: separate fftconv_bwd (du) + fftconv_bwd_dkf (dk_f)
+  3. TK fused: fftconv_bwd_fused (du + dk_f in one kernel launch)
 
-Usage:
-  # Build the fused kernel first:
-  cd /kernels/fftconv_bwd && make  # (with fused kernel config)
-  cd benchmarks && python run_benchmarks.py
+To get a full comparison graph, build both variants first:
+    cd kernels/fftconv_bwd
+    make                          # builds _C.so (two-kernel version)
+    cp _C*.so benchmarks/         # stash two-kernel .so
+    make fused                    # rebuilds _C.so (fused version)
+    cp _C*.so benchmarks/         # stash fused .so
 
-Prerequisites: matplotlib, numpy, torch, compiled _C module (fused kernel)
+Or use the Makefile targets:
+    make benchmark                # two-kernel build + benchmark
+    make benchmark-fused          # fused build + benchmark
+
+Usage (single run):
+    cd kernels/fftconv_bwd && make
+    python benchmarks/run_benchmarks.py
 """
 
-import sys
-import os
-import time
-import json
+import sys, os, json
 import numpy as np
 
-# Add parent dir to path for _C import
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + '/..')
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import torch
 
-# Try to import TK kernel; if unavailable, benchmark PyTorch-only
+# ── Import TK kernels (graceful) ─────────────────────────────────────────────
+
+try:
+    from _C import fftconv_bwd, fftconv_bwd_dkf
+    HAS_TK_SEPARATE = True
+    print("Loaded: TK two-kernel (fftconv_bwd + fftconv_bwd_dkf)")
+except ImportError:
+    HAS_TK_SEPARATE = False
+    print("INFO: TK two-kernel not in _C (build with 'make' to enable)")
+
 try:
     from _C import fftconv_bwd_fused
-    HAS_TK = True
-    print("Loaded: TK fftconv_bwd_fused kernel")
+    HAS_TK_FUSED = True
+    print("Loaded: TK fused (fftconv_bwd_fused)")
 except ImportError:
-    HAS_TK = False
-    print("WARNING: TK kernel not available (no _C module). Running PyTorch-only benchmarks.")
+    HAS_TK_FUSED = False
+    print("INFO: TK fused not in _C (build with 'make fused' to enable)")
 
 
-# ============================================================================
-# Helpers
-# ============================================================================
+# ── Matrix / twiddle helpers ──────────────────────────────────────────────────
+
+KERNEL_TILE = 64
 
 def fft_matrix(N):
     n = torch.arange(N); k = n.view(-1, 1)
@@ -49,292 +64,232 @@ def compute_twiddle_factors_fft(n, m):
     n_a = torch.arange(n).view(-1, 1); m_a = torch.arange(m)
     return torch.exp(-2j * torch.pi * n_a * m_a / (n * m))
 
-to_bf16_cuda = lambda t: t.to(torch.bfloat16).contiguous().cuda()
+def compute_twiddle_factors_ifft(n, m):
+    n_a = torch.arange(n).view(-1, 1); m_a = torch.arange(m)
+    return torch.exp(2j * torch.pi * n_a * m_a / (n * m))
+
+def to_tile_block_diag(mat):
+    """Lift N1xN1 matrix to 64x64 for left/right matrix multiplies.
+    For N1=32 (N=1024): block_diag(M, M) applies M independently to each
+    of the 4 batch subtiles packed into the 64x64 shared tile."""
+    if mat.shape[-1] == KERNEL_TILE:
+        return mat
+    return torch.block_diag(mat, mat)
+
+def to_tile_pointwise(mat):
+    """Lift N1xN1 (or HxN1xN1) matrix to 64x64 (or Hx64x64) for pointwise ops.
+    For N1=32: tiles the same values across all 4 quadrants so every batch
+    subtile sees the same twiddle / filter."""
+    if mat.shape[-1] == KERNEL_TILE:
+        return mat
+    return mat.repeat(2, 2) if mat.dim() == 2 else mat.repeat(1, 2, 2)
+
+bf16_cuda = lambda t: t.to(torch.bfloat16).contiguous().cuda()
 
 
-def prepare_tk_inputs(u, k, dy, B, H, N, N1):
-    """Prepare inputs for TK fused backward kernel."""
-    f_mat = fft_matrix(N1); finv_mat = ifft_matrix(N1)
-    tw = compute_twiddle_factors_fft(N1, N1)
-    tw_fwd = tw / N
-    twinv_bwd = tw_fwd.conj()
-    k_f = torch.fft.fft(k.float(), n=N)
+def prepare_du_inputs(u, k, dy, B, H, N, N1):
+    """Inputs for the two-kernel du backward."""
+    f_mat    = to_tile_block_diag(fft_matrix(N1))
+    finv_mat = to_tile_block_diag(ifft_matrix(N1))
+    tw       = to_tile_pointwise(compute_twiddle_factors_fft(N1, N1) / N)
+    twinv    = to_tile_pointwise(compute_twiddle_factors_ifft(N1, N1))
+    tw_bwd        = twinv.conj()
+    twinv_t_bwd   = tw.conj()
+    k_f  = torch.fft.fft(k.float(), n=N)
     k_fT = k_f.reshape(H, N1, N1).transpose(-1, -2)
-    kf_conj = k_fT.conj()
+    kf_conj = to_tile_pointwise(k_fT.conj())
+    dy_r = bf16_cuda(dy.reshape(B, H, N1, N1))
     return (
-        to_bf16_cuda(dy.reshape(B, H, N1, N1)),
-        to_bf16_cuda(u.reshape(B, H, N1, N1)),
-        to_bf16_cuda(kf_conj.real), to_bf16_cuda(kf_conj.imag),
-        to_bf16_cuda(f_mat.real), to_bf16_cuda(f_mat.imag),
-        to_bf16_cuda(finv_mat.real), to_bf16_cuda(finv_mat.imag),
-        to_bf16_cuda(tw.real), to_bf16_cuda(tw.imag),
-        to_bf16_cuda(twinv_bwd.real), to_bf16_cuda(twinv_bwd.imag),
+        dy_r,
+        bf16_cuda(kf_conj.real), bf16_cuda(kf_conj.imag),
+        bf16_cuda(f_mat.real),   bf16_cuda(f_mat.imag),
+        bf16_cuda(finv_mat.real),bf16_cuda(finv_mat.imag),
+        bf16_cuda(tw_bwd.real),  bf16_cuda(tw_bwd.imag),
+        bf16_cuda(twinv_t_bwd.real), bf16_cuda(twinv_t_bwd.imag),
+    )
+
+def prepare_dkf_inputs(u, dy, B, H, N, N1):
+    """Inputs for the two-kernel dk_f backward."""
+    f_mat = to_tile_block_diag(fft_matrix(N1))
+    tw    = to_tile_pointwise(compute_twiddle_factors_fft(N1, N1))  # no /N
+    return (
+        bf16_cuda(dy.reshape(B, H, N1, N1)),
+        bf16_cuda(u.reshape(B, H, N1, N1)),
+        bf16_cuda(f_mat.real), bf16_cuda(f_mat.imag),
+        bf16_cuda(tw.real),    bf16_cuda(tw.imag),
+    )
+
+def prepare_fused_inputs(u, k, dy, B, H, N, N1):
+    """Inputs for the fused backward kernel."""
+    f_mat    = to_tile_block_diag(fft_matrix(N1))
+    finv_mat = to_tile_block_diag(ifft_matrix(N1))
+    tw       = to_tile_pointwise(compute_twiddle_factors_fft(N1, N1))
+    tw_fwd   = to_tile_pointwise(compute_twiddle_factors_fft(N1, N1) / N)
+    twinv_bwd = tw_fwd.conj()
+    k_f  = torch.fft.fft(k.float(), n=N)
+    k_fT = k_f.reshape(H, N1, N1).transpose(-1, -2)
+    kf_conj = to_tile_pointwise(k_fT.conj())
+    return (
+        bf16_cuda(dy.reshape(B, H, N1, N1)),
+        bf16_cuda(u.reshape(B, H, N1, N1)),
+        bf16_cuda(kf_conj.real),  bf16_cuda(kf_conj.imag),
+        bf16_cuda(f_mat.real),    bf16_cuda(f_mat.imag),
+        bf16_cuda(finv_mat.real), bf16_cuda(finv_mat.imag),
+        bf16_cuda(tw.real),       bf16_cuda(tw.imag),
+        bf16_cuda(twinv_bwd.real),bf16_cuda(twinv_bwd.imag),
     )
 
 
-# ============================================================================
-# Benchmark: PyTorch autograd backward (forward FFT conv + .backward())
-# ============================================================================
+# ── Benchmark helpers ─────────────────────────────────────────────────────────
 
-def bench_pytorch_bwd(B, H, N, num_iters=50, warmup=10):
-    """PyTorch FFT conv forward + backward via autograd."""
-    u_data = torch.randn(B, H, N, device='cuda', dtype=torch.float32) / H
-    k_data = torch.randn(H, N, device='cuda', dtype=torch.float32) / H
-    dy = torch.randn(B, H, N, device='cuda', dtype=torch.float32) / H
-
-    def run():
-        u = u_data.detach().requires_grad_(True)
-        k = k_data.detach().requires_grad_(True)
-        u_f = torch.fft.fft(u, n=N)
-        k_f = torch.fft.fft(k, n=N)
-        y = torch.fft.ifft(u_f * k_f, n=N).real
-        loss = (y * dy).sum()
-        loss.backward()
-
+def _time_fn(fn, warmup=10, iters=50):
     for _ in range(warmup):
-        run()
+        fn()
     torch.cuda.synchronize()
-
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-
-    for i in range(num_iters):
-        start_events[i].record()
-        run()
-        end_events[i].record()
-
+    evs = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+           for _ in range(iters)]
+    for s, e in evs:
+        s.record(); fn(); e.record()
     torch.cuda.synchronize()
-    times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
-    return np.median(times)
+    return np.median([s.elapsed_time(e) for s, e in evs])
 
 
-def bench_pytorch_bwd_only(B, H, N, num_iters=50, warmup=10):
-    """PyTorch backward-only: IFFT(FFT(dy)*conj(FFT(k))) + dk reduction."""
-    u_data = torch.randn(B, H, N, device='cuda', dtype=torch.float32) / H
-    k_data = torch.randn(H, N, device='cuda', dtype=torch.float32) / H
+def bench_pytorch(B, H, N):
+    u = torch.randn(B, H, N, device='cuda', dtype=torch.float32) / H
+    k = torch.randn(H, N,    device='cuda', dtype=torch.float32) / H
     dy = torch.randn(B, H, N, device='cuda', dtype=torch.float32) / H
-
     def run():
         dy_f = torch.fft.fft(dy, n=N)
-        k_f = torch.fft.fft(k_data, n=N)
-        u_f = torch.fft.fft(u_data, n=N)
-        du = torch.fft.ifft(dy_f * k_f.conj(), n=N).real
-        dk = torch.fft.ifft((dy_f * u_f.conj()).sum(dim=0), n=N).real
-
-    for _ in range(warmup):
-        run()
-    torch.cuda.synchronize()
-
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-
-    for i in range(num_iters):
-        start_events[i].record()
-        run()
-        end_events[i].record()
-
-    torch.cuda.synchronize()
-    times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
-    return np.median(times)
+        k_f  = torch.fft.fft(k,  n=N)
+        u_f  = torch.fft.fft(u,  n=N)
+        _ = torch.fft.ifft(dy_f * k_f.conj(), n=N).real
+        _ = torch.fft.ifft((dy_f * u_f.conj()).sum(dim=0), n=N).real
+    return _time_fn(run)
 
 
-# ============================================================================
-# Benchmark: TK fused backward kernel
-# ============================================================================
-
-def bench_tk_fused(B, H, N, N1, num_iters=50, warmup=10):
-    """TK fused backward kernel (du + dk_f in one pass)."""
-    if not HAS_TK:
+def bench_tk_separate(B, H, N, N1):
+    if not HAS_TK_SEPARATE:
         return float('nan')
+    u  = torch.randn(B, H, N, device='cuda').float() / H
+    k  = torch.randn(H, N,    device='cuda').float() / H
+    dy = torch.randn(B, H, N, device='cuda').float() / H
+    du_args  = prepare_du_inputs(u, k, dy, B, H, N, N1)
+    dkf_args = prepare_dkf_inputs(u, dy, B, H, N, N1)
+    def run():
+        fftconv_bwd(*du_args, B, H, N, N1)
+        fftconv_bwd_dkf(*dkf_args, B, H, N, N1)
+    return _time_fn(run)
 
-    u = torch.randn(B, H, N, device='cuda', dtype=torch.bfloat16).float() / H
-    k = torch.randn(H, N, device='cuda', dtype=torch.bfloat16).float() / H
-    dy = torch.randn(B, H, N, device='cuda', dtype=torch.bfloat16).float() / H
 
-    args = prepare_tk_inputs(u, k, dy, B, H, N, N1)
-
+def bench_tk_fused(B, H, N, N1):
+    if not HAS_TK_FUSED:
+        return float('nan')
+    u  = torch.randn(B, H, N, device='cuda').float() / H
+    k  = torch.randn(H, N,    device='cuda').float() / H
+    dy = torch.randn(B, H, N, device='cuda').float() / H
+    args = prepare_fused_inputs(u, k, dy, B, H, N, N1)
     def run():
         fftconv_bwd_fused(*args, B, H, N, N1)
-
-    for _ in range(warmup):
-        run()
-    torch.cuda.synchronize()
-
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-
-    for i in range(num_iters):
-        start_events[i].record()
-        run()
-        end_events[i].record()
-
-    torch.cuda.synchronize()
-    times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
-    return np.median(times)
+    return _time_fn(run)
 
 
-# ============================================================================
-# Main benchmark suite
-# ============================================================================
+# ── Main suite ────────────────────────────────────────────────────────────────
 
-def run_all_benchmarks():
-    B_default = 16
-    H_default = 16
-    D = 128  # not used in current kernel (single-head per tile), but listed per spec
+CONFIGS = [
+    (2,  4,  "B=2,H=4"),
+    (4,  8,  "B=4,H=8"),
+    (8,  16, "B=8,H=16"),
+    (16, 16, "B=16,H=16"),
+    (32, 4,  "B=32,H=4"),
+    (32, 16, "B=32,H=16"),
+]
 
-    # Sequence lengths to test (N must be a perfect square for Monarch decomposition)
-    # 768=not square, 1536=not square, etc. The kernel requires N = N1^2.
-    # Available: 1024 (32^2), 4096 (64^2), 16384 (128^2)
-    # For the requested sequence lengths, we use the closest supported sizes.
-    seq_lengths = [1024, 4096]
+SEQ_LENGTHS = [1024, 4096]  # N must be N1^2 for Monarch decomposition
 
-    # Additional configs
-    configs = [
-        # (B, H, label)
-        (2, 4, "B=2,H=4"),
-        (4, 8, "B=4,H=8"),
-        (8, 16, "B=8,H=16"),
-        (16, 16, "B=16,H=16"),
-        (32, 4, "B=32,H=4"),
-        (32, 16, "B=32,H=16"),
-    ]
 
+def run_all():
     results = {}
-
-    for N in seq_lengths:
-        N1 = int(np.sqrt(N))
-        if N1 * N1 != N:
-            print(f"Skipping N={N} (not a perfect square)")
-            continue
-
-        print(f"\n{'='*60}")
-        print(f"Sequence length N={N} (N1={N1})")
-        print(f"{'='*60}")
-        print(f"{'Config':>12} | {'PyTorch bwd':>12} | {'PyTorch only':>12} | {'TK fused':>10} | {'Speedup':>8}")
-        print("-" * 70)
-
+    for N in SEQ_LENGTHS:
+        N1 = int(N ** 0.5)
+        assert N1 * N1 == N, f"N={N} is not a perfect square"
+        print(f"\n{'='*72}\nN={N} (N1={N1})\n{'='*72}")
+        hdr = f"{'Config':>12} | {'PyTorch':>10} | {'TK separate':>12} | {'TK fused':>10} | {'Sep 1x':>8} | {'Fused 1x':>8}"
+        print(hdr); print("-" * len(hdr))
         results[N] = []
-
-        for B, H, label in configs:
-            pytorch_ms = bench_pytorch_bwd(B, H, N) if torch.cuda.is_available() else float('nan')
-            pytorch_only_ms = bench_pytorch_bwd_only(B, H, N) if torch.cuda.is_available() else float('nan')
-            tk_ms = bench_tk_fused(B, H, N, N1)
-
-            speedup_vs_bwd = pytorch_ms / tk_ms if not np.isnan(tk_ms) and tk_ms > 0 else float('nan')
-            speedup_vs_only = pytorch_only_ms / tk_ms if not np.isnan(tk_ms) and tk_ms > 0 else float('nan')
-
-            results[N].append({
-                'B': B, 'H': H, 'label': label,
-                'pytorch_bwd_ms': pytorch_ms,
-                'pytorch_only_ms': pytorch_only_ms,
-                'tk_fused_ms': tk_ms,
-                'speedup_vs_bwd': speedup_vs_bwd,
-                'speedup_vs_only': speedup_vs_only,
-            })
-
-            tk_str = f"{tk_ms:.3f}" if not np.isnan(tk_ms) else "N/A"
-            su_str = f"{speedup_vs_bwd:.1f}x" if not np.isnan(speedup_vs_bwd) else "N/A"
-            print(f"{label:>12} | {pytorch_ms:>10.3f}ms | {pytorch_only_ms:>10.3f}ms | {tk_str:>8}ms | {su_str:>8}")
-
+        for B, H, label in CONFIGS:
+            pt   = bench_pytorch(B, H, N)
+            sep  = bench_tk_separate(B, H, N, N1)
+            fused = bench_tk_fused(B, H, N, N1)
+            sp_sep   = pt / sep   if not np.isnan(sep)   and sep   > 0 else float('nan')
+            sp_fused = pt / fused if not np.isnan(fused) and fused > 0 else float('nan')
+            fmt = lambda v: f"{v:.3f}ms" if not np.isnan(v) else "   N/A  "
+            fmx = lambda v: f"{v:.2f}x"  if not np.isnan(v) else "  N/A"
+            print(f"{label:>12} | {fmt(pt):>10} | {fmt(sep):>12} | {fmt(fused):>10} | {fmx(sp_sep):>8} | {fmx(sp_fused):>8}")
+            results[N].append(dict(label=label, B=B, H=H,
+                                   pytorch_ms=pt, tk_separate_ms=sep, tk_fused_ms=fused,
+                                   speedup_separate=sp_sep, speedup_fused=sp_fused))
     return results
 
 
-def plot_results(results):
-    """Generate PNG bar charts comparing TK vs PyTorch backward performance."""
+# ── Plotting ──────────────────────────────────────────────────────────────────
+
+def plot(results):
     try:
         import matplotlib
-        matplotlib.use('Agg')  # non-interactive backend
+        matplotlib.use('Agg')
         import matplotlib.pyplot as plt
     except ImportError:
-        print("matplotlib not available, skipping plots")
-        return
+        print("matplotlib not available — skipping plots"); return
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    colors = {'PyTorch': '#4ECDC4', 'TK separate': '#FF6B6B', 'TK fused': '#F7DC6F'}
 
-    for N, data in results.items():
-        if not data:
-            continue
+    for N, rows in results.items():
+        labels = [r['label'] for r in rows]
+        x = np.arange(len(labels)); w = 0.25
 
-        labels = [d['label'] for d in data]
-        pytorch_times = [d['pytorch_only_ms'] for d in data]
-        tk_times = [d['tk_fused_ms'] for d in data]
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
+        fig.suptitle(f'FFTConv Backward — N={N}', fontsize=13, fontweight='bold')
 
-        x = np.arange(len(labels))
-        width = 0.35
+        # Absolute times
+        ax1.bar(x - w, [r['pytorch_ms']     for r in rows], w, label='PyTorch',     color=colors['PyTorch'])
+        ax1.bar(x,     [r['tk_separate_ms'] for r in rows], w, label='TK separate', color=colors['TK separate'])
+        ax1.bar(x + w, [r['tk_fused_ms']    for r in rows], w, label='TK fused',    color=colors['TK fused'])
+        ax1.set_ylabel('Latency (ms)'); ax1.set_title('Absolute latency')
+        ax1.set_xticks(x); ax1.set_xticklabels(labels, rotation=30, ha='right')
+        ax1.legend(); ax1.grid(axis='y', alpha=0.3)
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-        # Bar chart: absolute times
-        bars1 = ax1.bar(x - width/2, pytorch_times, width, label='PyTorch bwd-only', color='#4ECDC4')
-        if HAS_TK:
-            bars2 = ax1.bar(x + width/2, tk_times, width, label='TK fused', color='#FF6B6B')
-        ax1.set_ylabel('Time (ms)')
-        ax1.set_title(f'FFTConv Backward — N={N}')
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(labels, rotation=45, ha='right')
-        ax1.legend()
-        ax1.grid(axis='y', alpha=0.3)
-
-        # Bar chart: speedup
-        speedups = [d['speedup_vs_only'] for d in data]
-        colors = ['#2ECC71' if s > 1 else '#E74C3C' for s in speedups]
-        if HAS_TK:
-            ax2.bar(x, speedups, width=0.5, color=colors)
-            ax2.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
-            ax2.set_ylabel('Speedup (TK / PyTorch)')
-            ax2.set_title(f'Speedup — N={N}')
-            ax2.set_xticks(x)
-            ax2.set_xticklabels(labels, rotation=45, ha='right')
-            ax2.grid(axis='y', alpha=0.3)
-        else:
-            ax2.text(0.5, 0.5, 'TK kernel not available\n(no GPU / not compiled)',
-                     transform=ax2.transAxes, ha='center', va='center', fontsize=12)
-            ax2.set_title(f'Speedup — N={N}')
+        # Speedup over PyTorch
+        ax2.bar(x - w/2, [r['speedup_separate'] for r in rows], w, label='TK separate', color=colors['TK separate'])
+        ax2.bar(x + w/2, [r['speedup_fused']    for r in rows], w, label='TK fused',    color=colors['TK fused'])
+        ax2.axhline(1, color='gray', linestyle='--', alpha=0.5, label='PyTorch baseline')
+        ax2.set_ylabel('Speedup vs PyTorch'); ax2.set_title('Speedup')
+        ax2.set_xticks(x); ax2.set_xticklabels(labels, rotation=30, ha='right')
+        ax2.legend(); ax2.grid(axis='y', alpha=0.3)
 
         plt.tight_layout()
-        outpath = os.path.join(script_dir, f'benchmark_N{N}.png')
-        plt.savefig(outpath, dpi=150)
-        plt.close()
-        print(f"Saved: {outpath}")
+        path = os.path.join(out_dir, f'benchmark_N{N}.png')
+        plt.savefig(path, dpi=150); plt.close()
+        print(f"Saved: {path}")
 
 
-# ============================================================================
-# Entry point
-# ============================================================================
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     if not torch.cuda.is_available():
-        print("No CUDA device available. Generating placeholder results.")
-        print("To get real benchmarks, run on a machine with an H100 GPU.")
+        print("No CUDA device — cannot benchmark. Run on an H100.")
+        sys.exit(0)
 
-        # Save placeholder data for documentation
-        results = {
-            4096: [
-                {'B': B, 'H': H, 'label': f'B={B},H={H}',
-                 'pytorch_bwd_ms': float('nan'), 'pytorch_only_ms': float('nan'),
-                 'tk_fused_ms': float('nan'), 'speedup_vs_bwd': float('nan'),
-                 'speedup_vs_only': float('nan')}
-                for B, H in [(2,4), (4,8), (8,16), (16,16), (32,4), (32,16)]
-            ]
-        }
-    else:
-        results = run_all_benchmarks()
+    results = run_all()
+    plot(results)
 
-    plot_results(results)
-
-    # Save raw data as JSON
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    json_path = os.path.join(script_dir, 'benchmark_results.json')
-    # Convert NaN to None for JSON serialization
-    def clean_for_json(obj):
-        if isinstance(obj, float) and np.isnan(obj):
-            return None
-        if isinstance(obj, dict):
-            return {k: clean_for_json(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [clean_for_json(v) for v in obj]
-        return obj
-
-    with open(json_path, 'w') as f:
-        json.dump(clean_for_json({str(k): v for k, v in results.items()}), f, indent=2)
-    print(f"Saved: {json_path}")
+    # Save JSON
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    def _clean(o):
+        if isinstance(o, float) and np.isnan(o): return None
+        if isinstance(o, dict): return {k: _clean(v) for k, v in o.items()}
+        if isinstance(o, list): return [_clean(v) for v in o]
+        return o
+    with open(os.path.join(out_dir, 'benchmark_results.json'), 'w') as f:
+        json.dump(_clean({str(k): v for k, v in results.items()}), f, indent=2)
+    print(f"Saved: {out_dir}/benchmark_results.json")

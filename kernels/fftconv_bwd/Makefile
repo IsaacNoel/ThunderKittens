@@ -25,4 +25,12 @@ test-fused:
 	$(MAKE) fused
 	python test_correctness_fused.py
 
-.PHONY: fused test test-fused
+# Benchmarks (require GPU)
+benchmark: $(OUT)
+	python benchmarks/run_benchmarks.py
+
+benchmark-fused:
+	$(MAKE) fused
+	python benchmarks/run_benchmarks.py
+
+.PHONY: fused test test-fused benchmark benchmark-fused
