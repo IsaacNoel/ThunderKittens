@@ -184,6 +184,8 @@ def bench_tk_separate(B, H, N, N1):
 def bench_tk_fused(B, H, N, N1):
     if not HAS_TK_FUSED:
         return float('nan')
+    if N != 4096:  # fused kernel only supports N=4096
+        return float('nan')
     u  = torch.randn(B, H, N, device='cuda').float() / H
     k  = torch.randn(H, N,    device='cuda').float() / H
     dy = torch.randn(B, H, N, device='cuda').float() / H
