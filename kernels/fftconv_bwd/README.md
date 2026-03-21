@@ -1,4 +1,4 @@
-# PR Proposal: FFTConv Backward Pass (`kernels/fftconv_bwd/`)
+# FFTConv Backward Pass (`kernels/fftconv_bwd/`)
 
 ## Summary
 
